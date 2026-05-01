@@ -1,9 +1,15 @@
 manifest_version: 1
 name: hermes-firewall
-version: 0.2.0
-description: Fail-open firewall webhook hooks for Hermes.
+version: 0.3.0
+description: Fail-open Silmaril SDK firewall hooks for Hermes.
 provides_hooks:
   - pre_llm_call
   - pre_tool_call
   - post_tool_call
   - transform_tool_result
+requires_env:
+  - name: SILMARIL_API_KEY
+    description: API key for the Silmaril Firewall classify API.
+    secret: true
+  - name: SILMARIL_API_URL
+    description: Tenant /classify endpoint for the Silmaril Firewall API.

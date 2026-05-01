@@ -1,7 +1,8 @@
-"""Pass-through firewall hooks for Hermes.
+"""Pass-through Silmaril Firewall SDK hooks for Hermes.
 
-This plugin calls a webhook for hook visibility. It fails open: webhook
-delivery errors are logged but never block or rewrite Hermes operations.
+This plugin classifies Hermes hook payloads with the Silmaril Security SDK.
+It fails open: SDK errors are logged but never block or rewrite Hermes
+operations.
 """
 
 from __future__ import annotations
@@ -9,26 +10,19 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any, Mapping
-from urllib import error as urllib_error
-from urllib import request as urllib_request
-
-try:
-    import requests
-except Exception:  # pragma: no cover - depends on the Hermes environment.
-    requests = None  # type: ignore[assignment]
 
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.2.0"
-DEFAULT_WEBHOOK_URL = (
-    "https://j8sqlvv9pi.execute-api.us-west-2.amazonaws.com/prod/webhook"
-)
-DEFAULT_WEBHOOK_TIMEOUT_SECONDS = 2.0
+PLUGIN_VERSION = "0.3.0"
+DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
+DEFAULT_SDK_THRESHOLD = 0.5
+DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
 DEFAULT_MAX_COLLECTION_ITEMS = 50
+_SDK_CLIENT: Any | None = None
+_SDK_CONFIG: tuple[str, str, float, float, int] | None = None
 
 
 def _safe_len(value: Any) -> int:
@@ -68,16 +62,8 @@ def _int_env(name: str, default: int) -> int:
     return max(128, parsed)
 
 
-def _webhook_url() -> str:
-    return os.getenv("HERMES_FIREWALL_WEBHOOK_URL", DEFAULT_WEBHOOK_URL).strip()
-
-
-def _webhook_timeout() -> float:
-    return _float_env("HERMES_FIREWALL_WEBHOOK_TIMEOUT_SECONDS", DEFAULT_WEBHOOK_TIMEOUT_SECONDS)
-
-
 def _max_payload_chars() -> int:
-    return _int_env("HERMES_FIREWALL_WEBHOOK_MAX_PAYLOAD_CHARS", DEFAULT_MAX_PAYLOAD_CHARS)
+    return _int_env("HERMES_FIREWALL_MAX_PAYLOAD_CHARS", DEFAULT_MAX_PAYLOAD_CHARS)
 
 
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
@@ -119,77 +105,77 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
     return repr(value)
 
 
-def _webhook_payload(event: str, fields: Mapping[str, Any], data: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "plugin": PLUGIN_NAME,
-        "plugin_version": PLUGIN_VERSION,
-        "event": event,
-        "timestamp": time.time(),
-        "fields": _json_safe(fields),
-        "data": _json_safe(data),
-    }
+def _sdk_timeout() -> float:
+    return _float_env("HERMES_FIREWALL_SDK_TIMEOUT_SECONDS", DEFAULT_SDK_TIMEOUT_SECONDS)
 
 
-def _post_with_requests(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, str]:
-    response = requests.post(url, json=payload, timeout=timeout)  # type: ignore[union-attr]
-    try:
-        body = response.json()
-    except ValueError:
-        body = response.text
-    return response.status_code, json.dumps(_json_safe(body), ensure_ascii=False)
-
-
-def _post_with_urllib(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, str]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib_request.urlopen(req, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8", errors="replace")
-            return response.status, response_body
-    except urllib_error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
-        return exc.code, response_body
-
-
-def _send_webhook(event: str, fields: Mapping[str, Any], data: Mapping[str, Any]) -> None:
-    url = _webhook_url()
-    if not url:
-        LOGGER.info("[%s] webhook disabled event=%s", PLUGIN_NAME, event)
-        return
-
-    payload = _webhook_payload(event, fields, data)
-    timeout = _webhook_timeout()
-
-    try:
-        if requests is not None:
-            status_code, response_body = _post_with_requests(url, payload, timeout)
-        else:
-            status_code, response_body = _post_with_urllib(url, payload, timeout)
-
-        if status_code >= 400:
-            LOGGER.warning(
-                "[%s] webhook returned error event=%s status=%s body=%s",
-                PLUGIN_NAME,
-                event,
-                status_code,
-                _json_safe(response_body),
-            )
-            return
-
-        LOGGER.info("[%s] webhook delivered event=%s status=%s", PLUGIN_NAME, event, status_code)
-    except Exception as exc:
+def _sdk_threshold() -> float:
+    value = _float_env("HERMES_FIREWALL_SDK_THRESHOLD", DEFAULT_SDK_THRESHOLD)
+    if value > 1.0:
         LOGGER.warning(
-            "[%s] webhook delivery failed open event=%s error=%s",
+            "[%s] HERMES_FIREWALL_SDK_THRESHOLD=%s is above 1.0; using 1.0",
             PLUGIN_NAME,
-            event,
-            exc,
+            value,
         )
-        LOGGER.debug("[%s] webhook delivery traceback", PLUGIN_NAME, exc_info=True)
+        return 1.0
+    return value
+
+
+def _sdk_max_retries() -> int:
+    value = os.getenv("HERMES_FIREWALL_SDK_MAX_RETRIES")
+    if not value:
+        return DEFAULT_SDK_MAX_RETRIES
+    try:
+        parsed = int(value)
+    except ValueError:
+        LOGGER.warning(
+            "[%s] invalid HERMES_FIREWALL_SDK_MAX_RETRIES=%r; using %s",
+            PLUGIN_NAME,
+            value,
+            DEFAULT_SDK_MAX_RETRIES,
+        )
+        return DEFAULT_SDK_MAX_RETRIES
+    return max(0, parsed)
+
+
+def _sdk_symbols() -> tuple[Any, Any]:
+    try:
+        from silmaril_security.sdk import Firewall, HookLabel
+    except Exception as exc:
+        raise RuntimeError(
+            "silmaril-security-sdk is not installed or could not be imported"
+        ) from exc
+    return Firewall, HookLabel
+
+
+def _firewall_client() -> Any:
+    global _SDK_CLIENT, _SDK_CONFIG
+
+    api_key = os.getenv("SILMARIL_API_KEY", "").strip()
+    api_url = os.getenv("SILMARIL_API_URL", "").strip()
+    if not api_key:
+        raise RuntimeError("SILMARIL_API_KEY is not configured")
+    if not api_url:
+        raise RuntimeError("SILMARIL_API_URL is not configured")
+
+    timeout = _sdk_timeout()
+    threshold = _sdk_threshold()
+    max_retries = _sdk_max_retries()
+    config = (api_key, api_url, threshold, timeout, max_retries)
+    if _SDK_CLIENT is not None and _SDK_CONFIG == config:
+        return _SDK_CLIENT
+
+    Firewall, _ = _sdk_symbols()
+    _SDK_CLIENT = Firewall(
+        api_key=api_key,
+        api_url=api_url,
+        threshold=threshold,
+        timeout=timeout,
+        shadow_mode=True,
+        max_retries=max_retries,
+    )
+    _SDK_CONFIG = config
+    return _SDK_CLIENT
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -197,9 +183,63 @@ def _log(event: str, **fields: Any) -> None:
     LOGGER.info("[%s] %s %s", PLUGIN_NAME, event, details)
 
 
-def _observe(event: str, fields: Mapping[str, Any], data: Mapping[str, Any] | None = None) -> None:
+def _result_dict(result: Any) -> dict[str, Any]:
+    score = getattr(result, "score", None)
+    threshold = getattr(result, "threshold", None)
+    blocked = None
+    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
+        blocked = score >= threshold
+    return {
+        "prediction": getattr(result, "prediction", None),
+        "score": score,
+        "threshold": threshold,
+        "blocked": blocked,
+        "primary_outcome": getattr(result, "primary_outcome", None),
+        "outcome_scores": getattr(result, "outcome_scores", None),
+    }
+
+
+def _text_for_classification(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
+
+
+def _classify(event: str, hook_name: str, text: str, tool_name: str | None = None) -> None:
+    try:
+        client = _firewall_client()
+        _, HookLabel = _sdk_symbols()
+        hook = getattr(HookLabel, hook_name)
+        result = client.classify(text, hook=hook, tool_name=tool_name, shadow_mode=True)
+        LOGGER.info(
+            "[%s] sdk_result event=%s hook=%s tool_name=%s output=%s",
+            PLUGIN_NAME,
+            event,
+            hook.value,
+            tool_name or "-",
+            json.dumps(_result_dict(result), ensure_ascii=False, sort_keys=True),
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "[%s] SDK classification failed open event=%s hook=%s tool_name=%s error=%s",
+            PLUGIN_NAME,
+            event,
+            hook_name,
+            tool_name or "-",
+            exc,
+        )
+        LOGGER.debug("[%s] SDK classification traceback", PLUGIN_NAME, exc_info=True)
+
+
+def _observe(
+    event: str,
+    fields: Mapping[str, Any],
+    hook_name: str,
+    text: str,
+    tool_name: str | None = None,
+) -> None:
     _log(event, **fields)
-    _send_webhook(event, fields, data or {})
+    _classify(event, hook_name, text, tool_name=tool_name)
 
 
 def pre_llm_call(
@@ -223,11 +263,8 @@ def pre_llm_call(
     _observe(
         "pre_llm_call",
         fields,
-        {
-            "user_message": user_message,
-            "conversation_history_len": _safe_len(conversation_history or []),
-            "kwargs": kwargs,
-        },
+        "USER_INPUT",
+        user_message,
     )
     return None
 
@@ -251,10 +288,9 @@ def pre_tool_call(
     _observe(
         "pre_tool_call",
         fields,
-        {
-            "args": args or {},
-            "kwargs": kwargs,
-        },
+        "TOOL_CALL",
+        _text_for_classification({"tool_name": tool_name, "args": args or {}}),
+        tool_name=tool_name or None,
     )
     return None
 
@@ -281,11 +317,9 @@ def post_tool_call(
     _observe(
         "post_tool_call",
         fields,
-        {
-            "args": args or {},
-            "result": result,
-            "kwargs": kwargs,
-        },
+        "TOOL_RESPONSE",
+        result,
+        tool_name=tool_name or None,
     )
     return None
 
@@ -312,11 +346,9 @@ def transform_tool_result(
     _observe(
         "transform_tool_result",
         fields,
-        {
-            "args": args or {},
-            "result": result,
-            "kwargs": kwargs,
-        },
+        "TOOL_RESPONSE",
+        result,
+        tool_name=tool_name or None,
     )
     return result
 
