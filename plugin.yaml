@@ -1,7 +1,7 @@
 manifest_version: 1
 name: hermes-firewall
-version: 0.1.0
-description: Pass-through firewall hook logger for Hermes.
+version: 0.2.0
+description: Fail-open firewall webhook hooks for Hermes.
 provides_hooks:
   - pre_llm_call
   - pre_tool_call
