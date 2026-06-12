@@ -210,6 +210,10 @@ def _text_for_classification(value: Any) -> str:
     return json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
 
 
+def _metadata_value(value: Any) -> Any:
+    return None if value in {"", "-"} else value
+
+
 def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "silmaril": {
@@ -217,12 +221,12 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
             "version": PLUGIN_VERSION,
         },
         "hermesHookEvent": event,
-        "sessionId": fields.get("session_id"),
-        "taskId": fields.get("task_id"),
-        "toolCallId": fields.get("tool_call_id"),
-        "toolName": fields.get("tool_name"),
-        "model": fields.get("model"),
-        "platform": fields.get("platform"),
+        "sessionId": _metadata_value(fields.get("session_id")),
+        "taskId": _metadata_value(fields.get("task_id")),
+        "toolCallId": _metadata_value(fields.get("tool_call_id")),
+        "toolName": _metadata_value(fields.get("tool_name")),
+        "model": _metadata_value(fields.get("model")),
+        "platform": _metadata_value(fields.get("platform")),
     }
 
 

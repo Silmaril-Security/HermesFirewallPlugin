@@ -176,6 +176,8 @@ class HermesFirewallTests(unittest.TestCase):
         )
         pre_tool_metadata = FakeFirewall.calls[1]["options"]["metadata"]
         self.assertEqual(pre_tool_metadata["hermesHookEvent"], "pre_tool_call")
+        self.assertIsNone(pre_tool_metadata["sessionId"])
+        self.assertIsNone(pre_tool_metadata["taskId"])
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
 
