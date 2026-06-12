@@ -297,8 +297,8 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
     if result is None:
         return False
     prediction = result.get("prediction")
-    if isinstance(prediction, str) and prediction.lower() == "malicious":
-        return True
+    if isinstance(prediction, str):
+        return prediction.lower() == "malicious"
     blocked = result.get("blocked")
     return bool(blocked) if isinstance(blocked, bool) else False
 
@@ -354,7 +354,7 @@ def pre_tool_call(
     session_id: str = "",
     tool_call_id: str = "",
     **kwargs: Any,
-) -> None:
+) -> dict[str, str] | None:
     """Observe a tool call before execution. Return None to allow it."""
     fields = {
         "session_id": session_id or "-",

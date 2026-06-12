@@ -96,6 +96,10 @@ class HermesFirewallTests(unittest.TestCase):
             os.environ.pop(key, None)
         firewall._SDK_CLIENT = None
         firewall._SDK_CONFIG = None
+        FakeFirewall.instances = []
+        FakeFirewall.calls = []
+        FakeFirewall.next_result = FakeResult()
+        FakeFirewall.error = None
 
     def test_registers_all_supported_pass_through_hooks(self) -> None:
         reset_state()
@@ -112,6 +116,10 @@ class HermesFirewallTests(unittest.TestCase):
                 "transform_tool_result",
                 "transform_llm_output",
             ],
+        )
+        self.assertEqual(
+            firewall.pre_tool_call.__annotations__["return"],
+            "dict[str, str] | None",
         )
 
     def test_missing_config_fails_open_without_sdk_call(self) -> None:
@@ -220,6 +228,23 @@ class HermesFirewallTests(unittest.TestCase):
             "bad",
         )
         self.assertEqual(firewall.transform_llm_output(response_text="bad"), "bad")
+
+    def test_optional_enforcement_respects_explicit_benign_prediction(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="BENIGN",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="benign",
+        )
+
+        self.assertIsNone(
+            firewall.pre_tool_call(tool_name="terminal", args={"command": "echo allowed"})
+        )
 
     def test_classifier_errors_fail_open_without_raw_error_text(self) -> None:
         reset_state(
