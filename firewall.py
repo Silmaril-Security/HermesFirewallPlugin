@@ -440,6 +440,7 @@ def transform_tool_result(
 def transform_llm_output(
     response_text: str = "",
     session_id: str = "",
+    task_id: str = "",
     model: str = "",
     platform: str = "",
     **kwargs: Any,
@@ -447,6 +448,7 @@ def transform_llm_output(
     """Observe final assistant output and return it unchanged."""
     fields = {
         "session_id": session_id or "-",
+        "task_id": task_id or "-",
         "model": model or "-",
         "platform": platform or "-",
         "response_chars": _safe_len(response_text),

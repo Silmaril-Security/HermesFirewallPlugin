@@ -166,7 +166,7 @@ class HermesFirewallTests(unittest.TestCase):
             "unchanged",
         )
         self.assertEqual(
-            firewall.transform_llm_output(response_text="final answer", session_id="s1"),
+            firewall.transform_llm_output(response_text="final answer", session_id="s1", task_id="task1"),
             "final answer",
         )
 
@@ -180,6 +180,9 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertIsNone(pre_tool_metadata["taskId"])
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
+        llm_output_metadata = FakeFirewall.calls[4]["options"]["metadata"]
+        self.assertEqual(llm_output_metadata["hermesHookEvent"], "transform_llm_output")
+        self.assertEqual(llm_output_metadata["taskId"], "task1")
 
     def test_empty_payloads_fail_open_without_classifier_call(self) -> None:
         reset_state(

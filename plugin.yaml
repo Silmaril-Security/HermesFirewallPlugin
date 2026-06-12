@@ -14,5 +14,12 @@ requires_env:
     secret: true
   - name: SILMARIL_API_URL
     description: Tenant /classify endpoint for the Silmaril Firewall API.
+optional_env:
   - name: HERMES_FIREWALL_BLOCK_MALICIOUS
-    description: Optional. Set true to block malicious pre_tool_call events.
+    description: Set true to block malicious pre_tool_call events.
+  - name: HERMES_FIREWALL_SDK_TIMEOUT_SECONDS
+    description: SDK request timeout in seconds. Defaults to 2.0.
+  - name: HERMES_FIREWALL_SDK_MAX_RETRIES
+    description: SDK retry count. Defaults to 0.
+  - name: HERMES_FIREWALL_MAX_PAYLOAD_CHARS
+    description: Maximum classified payload length. Defaults to 8000 characters.
