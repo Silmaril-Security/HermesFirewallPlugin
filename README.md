@@ -146,3 +146,7 @@ hermes plugins update hermes-firewall
 hermes plugins disable hermes-firewall
 hermes plugins remove hermes-firewall
 ```
+
+## License
+
+This plugin is licensed under Apache-2.0. See `LICENSE` and `NOTICE`.
