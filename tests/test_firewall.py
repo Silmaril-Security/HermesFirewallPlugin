@@ -375,6 +375,15 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertIn("never the raw key", readme)
         self.assertIn("never prints `SILMARIL_API_KEY`", after_install)
 
+    def test_license_metadata_is_packaged(self) -> None:
+        plugin_yaml = Path("plugin.yaml").read_text(encoding="utf-8")
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("license: Apache-2.0", plugin_yaml)
+        self.assertIn("Apache-2.0", readme)
+        self.assertTrue(Path("LICENSE").is_file())
+        self.assertTrue(Path("NOTICE").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

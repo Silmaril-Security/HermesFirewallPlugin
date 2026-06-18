@@ -1,6 +1,7 @@
 manifest_version: 1
 name: hermes-firewall
 version: 0.4.0
+license: Apache-2.0
 description: Fail-open Silmaril SDK firewall hooks for Hermes with opt-in pre-tool enforcement.
 provides_hooks:
   - pre_llm_call
