@@ -20,7 +20,7 @@ ROUTES = {
 
 
 def normalize_base_url(value: str | None) -> str:
-    raw = (value or DEFAULT_DEMO_BASE_URL).strip()
+    raw = (value or "").strip() or DEFAULT_DEMO_BASE_URL
     if raw.startswith(("http://", "https://")):
         return raw
     return f"https://{raw}"
@@ -61,8 +61,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--open", action="store_true", help="Open the URL with the system browser.")
     parser.add_argument("--json", action="store_true", help="Print JSON status instead of a bare URL.")
-    parser.add_argument("--playground", action="store_true", help="Open the playground route.")
-    parser.add_argument("--route", choices=("setup", "playground"), default=None)
+    route_group = parser.add_mutually_exclusive_group()
+    route_group.add_argument(
+        "--playground",
+        action="store_true",
+        help="Open the playground route (shortcut for --route playground).",
+    )
+    route_group.add_argument("--route", choices=("setup", "playground"), default=None)
     return parser.parse_args(argv)
 
 

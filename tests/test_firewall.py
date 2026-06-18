@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import types
@@ -335,6 +337,17 @@ class HermesFirewallTests(unittest.TestCase):
             demo.build_demo_url("http://localhost:3001", "setup"),
             "http://localhost:3001/demo/setup-complete",
         )
+        self.assertEqual(
+            demo.build_demo_url("   "),
+            "https://app.silmaril.dev/demo/setup-complete",
+        )
+
+    def test_demo_launcher_rejects_conflicting_route_options(self) -> None:
+        demo = load_demo_launcher()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                demo._parse_args(["--playground", "--route", "setup"])
 
     def test_demo_launcher_json_status_omits_raw_api_key(self) -> None:
         demo = load_demo_launcher()
