@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import unittest
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ ENV_KEYS = {
     "HERMES_FIREWALL_MAX_PAYLOAD_CHARS",
     "HERMES_FIREWALL_SDK_MAX_RETRIES",
     "HERMES_FIREWALL_SDK_TIMEOUT_SECONDS",
+    "SILMARIL_DEMO_BASE_URL",
 }
 
 
@@ -88,6 +90,16 @@ def reset_state(**env: str) -> None:
         os.environ.pop(key, None)
     os.environ.update(env)
     install_fake_sdk()
+
+
+def load_demo_launcher() -> Any:
+    path = Path("scripts/open_playground.py")
+    spec = importlib.util.spec_from_file_location("open_playground_under_test", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class HermesFirewallTests(unittest.TestCase):
@@ -307,6 +319,48 @@ class HermesFirewallTests(unittest.TestCase):
     def test_requirements_pin_sdk_042(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
         self.assertIn("silmaril-security-sdk==0.4.2", requirements)
+
+    def test_demo_launcher_builds_public_setup_and_playground_urls(self) -> None:
+        demo = load_demo_launcher()
+
+        self.assertEqual(
+            demo.build_demo_url(),
+            "https://app.silmaril.dev/demo/setup-complete",
+        )
+        self.assertEqual(
+            demo.build_demo_url("app.silmaril.dev", "playground"),
+            "https://app.silmaril.dev/demo/playground",
+        )
+        self.assertEqual(
+            demo.build_demo_url("http://localhost:3001", "setup"),
+            "http://localhost:3001/demo/setup-complete",
+        )
+
+    def test_demo_launcher_json_status_omits_raw_api_key(self) -> None:
+        demo = load_demo_launcher()
+
+        status = demo.resolve_runtime_config({
+            "SILMARIL_API_URL": " https://tenant.example/classify ",
+            "SILMARIL_API_KEY": "secret-key",
+        })
+
+        self.assertEqual(status, {
+            "configured": True,
+            "apiUrl": "https://tenant.example/classify",
+            "hasApiKey": True,
+        })
+        self.assertNotIn("secret-key", repr(status))
+
+    def test_docs_and_env_example_cover_demo_and_runtime_config(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        readme = Path("README.md").read_text(encoding="utf-8")
+        after_install = Path("after-install.md").read_text(encoding="utf-8")
+
+        self.assertIn("SILMARIL_API_KEY=replace-me", env_example)
+        self.assertIn("SILMARIL_DEMO_BASE_URL", env_example)
+        self.assertIn("scripts/open_playground.py", readme)
+        self.assertIn("never the raw key", readme)
+        self.assertIn("never prints `SILMARIL_API_KEY`", after_install)
 
 
 if __name__ == "__main__":

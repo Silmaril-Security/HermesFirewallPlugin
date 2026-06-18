@@ -21,6 +21,9 @@ that runs Hermes:
 pip install silmaril-security-sdk==0.4.2
 ```
 
+Copy `.env.example` into your Hermes environment manager or shell profile and
+replace placeholder values there. Do not commit real API keys.
+
 Local development install on macOS/Linux:
 
 ```bash
@@ -71,6 +74,11 @@ Optional environment variables:
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
 - `HERMES_FIREWALL_BLOCK_MALICIOUS` enables optional `pre_tool_call` blocking. Default: `false`.
 
+Configuration precedence is Hermes-native and environment-based: the hook reads
+the process environment used by Hermes at call time. There is no local config
+file parser, credential service, or fallback that writes secrets into plugin
+state.
+
 ## Enforcement
 
 Hermes currently supports blocking through `pre_tool_call` only. This plugin
@@ -99,11 +107,36 @@ shape:
 }
 ```
 
+## Public Demo
+
+The demo launcher opens the hosted Silmaril Firewall UI at
+`https://app.silmaril.dev/demo/setup-complete`. It does not serve a local UI,
+start a credential proxy, or put `SILMARIL_API_KEY` in the URL, terminal output,
+or chat.
+
+Run it from the repository root:
+
+```bash
+python scripts/open_playground.py
+python scripts/open_playground.py --open
+python scripts/open_playground.py --route playground --json
+```
+
+For preview validation, override the hosted base URL:
+
+```bash
+SILMARIL_DEMO_BASE_URL="http://localhost:3001" python scripts/open_playground.py
+```
+
+The JSON status output includes the configured API URL and a boolean
+`hasApiKey`, but never the raw key.
+
 ## Development
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py'
 python -m py_compile firewall.py __init__.py
+python -m py_compile scripts/open_playground.py
 ```
 
 ## Manage

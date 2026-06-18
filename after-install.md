@@ -24,8 +24,21 @@ pip install silmaril-security-sdk==0.4.2
 Set `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes environment before
 restarting Hermes.
 
+The repository includes `.env.example` with all required and optional settings.
+Configuration is read from the Hermes process environment at hook execution
+time. Do not commit real API keys.
+
 Restart Hermes to load the plugin:
 
 ```bash
 hermes gateway restart
 ```
+
+To open the public Silmaril Firewall demo after configuring Hermes:
+
+```bash
+python scripts/open_playground.py --open
+```
+
+The launcher prints or opens `https://app.silmaril.dev/demo/setup-complete`,
+supports `--route playground` and `--json`, and never prints `SILMARIL_API_KEY`.
