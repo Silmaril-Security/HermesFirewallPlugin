@@ -308,9 +308,6 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
             return False
     else:
         normalized_prediction = ""
-    primary_outcome = result.get("primary_outcome")
-    if isinstance(primary_outcome, str) and primary_outcome.lower() == "benign":
-        return False
     score = result.get("score")
     threshold = result.get("threshold")
     if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
@@ -468,7 +465,7 @@ def transform_tool_result(
     duration_ms: int | None = None,
     **kwargs: Any,
 ) -> str:
-    """Observe a transform hook and return the original result unchanged."""
+    """Observe a transform hook and return the result or a safe replacement."""
     fields = {
         "session_id": session_id or "-",
         "task_id": task_id or "-",
@@ -502,7 +499,7 @@ def transform_llm_output(
     platform: str = "",
     **kwargs: Any,
 ) -> str:
-    """Observe final assistant output and return it unchanged."""
+    """Observe final assistant output and return it or a safe replacement."""
     fields = {
         "session_id": session_id or "-",
         "task_id": task_id or "-",

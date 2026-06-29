@@ -285,6 +285,23 @@ class HermesFirewallTests(unittest.TestCase):
             "allowed output",
         )
 
+    def test_optional_enforcement_honors_threshold_over_benign_primary_outcome(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="benign",
+        )
+
+        blocked = firewall.transform_tool_result(tool_name="terminal", result="risky output")
+        self.assertIn("Silmaril Firewall blocked malicious content", blocked)
+        self.assertNotIn("risky output", blocked)
+
     def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
