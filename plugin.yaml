@@ -2,7 +2,7 @@ manifest_version: 1
 name: hermes-firewall
 version: 0.4.0
 license: Apache-2.0
-description: Fail-open Silmaril SDK firewall hooks for Hermes with opt-in pre-tool enforcement.
+description: Fail-open Silmaril SDK firewall hooks for Hermes with opt-in enforcement.
 provides_hooks:
   - pre_llm_call
   - pre_tool_call
@@ -17,7 +17,7 @@ requires_env:
     description: Tenant /classify endpoint for the Silmaril Firewall API.
 optional_env:
   - name: HERMES_FIREWALL_BLOCK_MALICIOUS
-    description: Set true to block malicious pre_tool_call events.
+    description: Set true to block malicious content at supported pre-tool and transform boundaries.
   - name: HERMES_FIREWALL_SDK_TIMEOUT_SECONDS
     description: SDK request timeout in seconds. Defaults to 2.0.
   - name: HERMES_FIREWALL_SDK_MAX_RETRIES

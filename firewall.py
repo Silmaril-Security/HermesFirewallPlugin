@@ -2,8 +2,9 @@
 
 This plugin classifies Hermes hook payloads with the Silmaril Security SDK.
 It defaults to shadow/pass-through mode. SDK errors are logged without raw
-payloads and fail open. Optional blocking is limited to Hermes pre_tool_call,
-the only current plugin hook that can veto execution.
+payloads and fail open. Optional blocking applies to pre_tool_call and to
+Hermes transform hooks that can replace post-execution tool or final LLM output
+before downstream use.
 """
 
 from __future__ import annotations
@@ -302,13 +303,26 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
         return False
     prediction = result.get("prediction")
     if isinstance(prediction, str):
-        return prediction.lower() == "malicious"
+        normalized_prediction = prediction.lower()
+        if normalized_prediction == "benign":
+            return False
+    else:
+        normalized_prediction = ""
+    primary_outcome = result.get("primary_outcome")
+    if isinstance(primary_outcome, str) and primary_outcome.lower() == "benign":
+        return False
+    score = result.get("score")
+    threshold = result.get("threshold")
+    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
+        return score >= threshold
+    if normalized_prediction == "malicious":
+        return True
     blocked = result.get("blocked")
     return bool(blocked) if isinstance(blocked, bool) else False
 
 
-def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
-    parts = ["Silmaril Firewall classified this tool call as malicious"]
+def _block_message(result: Mapping[str, Any], subject: str) -> str:
+    parts = [f"Silmaril Firewall classified this {subject} as malicious"]
     primary_outcome = result.get("primary_outcome")
     score = result.get("score")
     threshold = result.get("threshold")
@@ -318,10 +332,46 @@ def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
         parts.append(f"score={score}")
     if isinstance(threshold, (int, float)):
         parts.append(f"threshold={threshold}")
+    return "; ".join(parts)
+
+
+def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
     return {
         "action": "block",
-        "message": "; ".join(parts),
+        "message": _block_message(result, "tool call"),
     }
+
+
+def _blocked_replacement(
+    event: str,
+    fields: Mapping[str, Any],
+    hook_name: str,
+    result: Mapping[str, Any],
+) -> str:
+    replacement = {
+        "silmarilFirewall": {
+            "blocked": True,
+            "hook": hook_name,
+            "hermesHookEvent": event,
+            "toolName": _metadata_value(fields.get("tool_name")),
+            "toolCallId": _metadata_value(fields.get("tool_call_id")),
+            "reason": _block_message(result, "content"),
+            "classification": {
+                "prediction": result.get("prediction"),
+                "score": result.get("score"),
+                "threshold": result.get("threshold"),
+                "primary_outcome": result.get("primary_outcome"),
+                "outcome_scores": result.get("outcome_scores") or {},
+                "detector_scores": result.get("detector_scores") or {},
+                "detector_counts": result.get("detector_counts") or {},
+            },
+        },
+    }
+    return (
+        "Silmaril Firewall blocked malicious content before downstream model consumption:\n```json\n"
+        + json.dumps(replacement, ensure_ascii=False, sort_keys=True, indent=2)
+        + "\n```"
+    )
 
 
 def pre_llm_call(
@@ -427,13 +477,20 @@ def transform_tool_result(
         "duration_ms": duration_ms if duration_ms is not None else "-",
         "result_chars": _safe_len(result),
     }
-    _observe(
+    observed = _observe(
         "transform_tool_result",
         fields,
         "TOOL_RESPONSE",
         result,
         tool_name=tool_name or None,
     )
+    if _block_malicious() and _is_malicious(observed):
+        return _blocked_replacement(
+            "transform_tool_result",
+            fields,
+            "TOOL_RESPONSE",
+            observed,
+        )
     return result
 
 
@@ -453,12 +510,19 @@ def transform_llm_output(
         "platform": platform or "-",
         "response_chars": _safe_len(response_text),
     }
-    _observe(
+    observed = _observe(
         "transform_llm_output",
         fields,
         "LLM_OUTPUT",
         response_text,
     )
+    if _block_malicious() and _is_malicious(observed):
+        return _blocked_replacement(
+            "transform_llm_output",
+            fields,
+            "LLM_OUTPUT",
+            observed,
+        )
     return response_text
 
 

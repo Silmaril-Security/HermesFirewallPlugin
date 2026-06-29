@@ -2,8 +2,8 @@
 
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
 with the Silmaril Security SDK. It defaults to shadow/pass-through mode without
-rewriting or injecting context, and can optionally block malicious pre-tool
-execution events where Hermes supports blocking.
+injecting context, and can optionally block malicious pre-tool calls plus
+replace malicious tool or final LLM output at Hermes transform boundaries.
 
 ## Install
 
@@ -47,9 +47,9 @@ The plugin registers five hooks:
 
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when `HERMES_FIREWALL_BLOCK_MALICIOUS=true` and the classifier returns a malicious result.
-- `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE`.
-- `transform_tool_result` classifies the tool result with `HookLabel.TOOL_RESPONSE`, then returns the original result unchanged.
-- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT`, then returns the original response unchanged.
+- `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
+- `transform_tool_result` classifies the tool result with `HookLabel.TOOL_RESPONSE`, then returns the original result by default or a safe replacement when blocking is enabled and the result is malicious.
+- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT`, then returns the original response by default or a safe replacement when blocking is enabled and the output is malicious.
 
 The SDK client is created with `shadow_mode=True`, so classification output is
 logged without relying on SDK exceptions for control flow. SDK import,
@@ -72,7 +72,7 @@ Optional environment variables:
 - `HERMES_FIREWALL_SDK_TIMEOUT_SECONDS` controls the SDK request timeout. Default: `2.0`.
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
-- `HERMES_FIREWALL_BLOCK_MALICIOUS` enables optional `pre_tool_call` blocking. Default: `false`.
+- `HERMES_FIREWALL_BLOCK_MALICIOUS` enables optional blocking at supported pre-tool and transform boundaries. Default: `false`.
 
 Configuration precedence is Hermes-native and environment-based: the hook reads
 the process environment used by Hermes at call time. There is no local config
@@ -81,9 +81,9 @@ state.
 
 ## Enforcement
 
-Hermes currently supports blocking through `pre_tool_call` only. This plugin
-therefore never blocks `pre_llm_call`, `post_tool_call`, `transform_tool_result`,
-or `transform_llm_output`, even when the classifier result is malicious.
+Hermes supports pre-execution vetoes through `pre_tool_call` and post-execution
+replacement through `transform_tool_result` and `transform_llm_output`.
+`post_tool_call` remains observe-only because it has no return channel.
 
 Default behavior is pass-through:
 
@@ -91,7 +91,7 @@ Default behavior is pass-through:
 HERMES_FIREWALL_BLOCK_MALICIOUS=false
 ```
 
-To enable pre-tool enforcement:
+To enable enforcement at supported boundaries:
 
 ```bash
 HERMES_FIREWALL_BLOCK_MALICIOUS=true
@@ -106,6 +106,10 @@ shape:
   "message": "Silmaril Firewall classified this tool call as malicious; primary_outcome=control_abuse; score=0.99; threshold=0.5"
 }
 ```
+
+Malicious transform-hook classifications return a safe replacement string with
+the hook, tool id when present, score, threshold, and primary outcome. The
+replacement does not include the original tool output or assistant text.
 
 ## Public Demo
 

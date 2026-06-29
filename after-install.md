@@ -8,8 +8,9 @@ Security SDK. SDK output is logged for each call without raw classified text.
 SDK failures are logged and fail open. Default behavior does not block tools,
 inject context, or rewrite tool results.
 
-Optional enforcement is available only for Hermes `pre_tool_call`, the hook
-that can veto execution:
+Optional enforcement is available at Hermes boundaries that can act on content:
+`pre_tool_call` can veto execution, while `transform_tool_result` and
+`transform_llm_output` can replace malicious content before downstream use:
 
 ```bash
 HERMES_FIREWALL_BLOCK_MALICIOUS=true
