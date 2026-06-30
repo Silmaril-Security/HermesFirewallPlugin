@@ -223,7 +223,7 @@ class HermesFirewallTests(unittest.TestCase):
 
         self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"}))
 
-    def test_optional_enforcement_blocks_only_pre_tool_call(self) -> None:
+    def test_optional_enforcement_blocks_pre_tool_and_transform_outputs(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
@@ -241,12 +241,28 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertIn("primary_outcome=control_abuse", blocked["message"])
         self.assertIn("score=0.99", blocked["message"])
 
-        self.assertIsNone(firewall.post_tool_call(tool_name="terminal", result="bad"))
-        self.assertEqual(
-            firewall.transform_tool_result(tool_name="terminal", result="bad"),
-            "bad",
+        raw_tool_output = "raw malicious tool output"
+        raw_llm_output = "raw malicious final output"
+        self.assertIsNone(firewall.post_tool_call(tool_name="terminal", result=raw_tool_output))
+
+        tool_replacement = firewall.transform_tool_result(
+            tool_name="terminal",
+            result=raw_tool_output,
+            tool_call_id="tc1",
         )
-        self.assertEqual(firewall.transform_llm_output(response_text="bad"), "bad")
+        self.assertIn("Silmaril Firewall blocked malicious content", tool_replacement)
+        self.assertIn('"blocked": true', tool_replacement)
+        self.assertIn('"toolCallId": "tc1"', tool_replacement)
+        self.assertNotIn(raw_tool_output, tool_replacement)
+
+        llm_replacement = firewall.transform_llm_output(
+            response_text=raw_llm_output,
+            session_id="s1",
+            task_id="task1",
+        )
+        self.assertIn("Silmaril Firewall blocked malicious content", llm_replacement)
+        self.assertIn('"hook": "LLM_OUTPUT"', llm_replacement)
+        self.assertNotIn(raw_llm_output, llm_replacement)
 
     def test_optional_enforcement_respects_explicit_benign_prediction(self) -> None:
         reset_state(
@@ -263,6 +279,45 @@ class HermesFirewallTests(unittest.TestCase):
 
         self.assertIsNone(
             firewall.pre_tool_call(tool_name="terminal", args={"command": "echo allowed"})
+        )
+        self.assertEqual(
+            firewall.transform_tool_result(tool_name="terminal", result="allowed output"),
+            "allowed output",
+        )
+
+    def test_optional_enforcement_honors_threshold_over_benign_primary_outcome(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="benign",
+        )
+
+        blocked = firewall.transform_tool_result(tool_name="terminal", result="risky output")
+        self.assertIn("Silmaril Firewall blocked malicious content", blocked)
+        self.assertNotIn("risky output", blocked)
+
+    def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.49,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+
+        self.assertEqual(
+            firewall.transform_llm_output(response_text="low-score output"),
+            "low-score output",
         )
 
     def test_classifier_errors_fail_open_without_raw_error_text(self) -> None:
