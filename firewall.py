@@ -22,6 +22,7 @@ DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
 DEFAULT_MAX_COLLECTION_ITEMS = 50
+DELEGATION_TOOL_NAME = "delegate_task"
 _SDK_CLIENT: Any | None = None
 _SDK_CONFIG: tuple[str, str, float, int] | None = None
 
@@ -341,7 +342,15 @@ def _risk_label(result: Mapping[str, Any]) -> str:
         "service_disruption": "Service disruption risk",
         "data_exfiltration": "Sensitive data exfiltration risk",
     }
-    return labels.get(normalized, "Unsafe content")
+    label = labels.get(normalized)
+    if label is None:
+        LOGGER.debug(
+            "[%s] unknown primary_outcome=%r; using generic risk label",
+            PLUGIN_NAME,
+            outcome,
+        )
+        return "Unsafe content"
+    return label
 
 
 def _surface_label(event: str, fields: Mapping[str, Any], hook_name: str) -> str:
@@ -423,7 +432,12 @@ def pre_tool_call(
     tool_call_id: str = "",
     **kwargs: Any,
 ) -> dict[str, str] | None:
-    """Observe a tool call before execution. Return None to allow it."""
+    """Observe a tool call before execution. Return None to allow it.
+
+    Hermes currently exposes child-agent delegation as the delegate_task tool.
+    Because this hook scans every tool call, that delegation path is covered
+    here before subagent_start's observer-only visibility hook fires.
+    """
     fields = {
         "session_id": session_id or "-",
         "task_id": task_id or "-",

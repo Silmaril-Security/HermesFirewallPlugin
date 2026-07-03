@@ -88,8 +88,9 @@ Hermes supports pre-execution vetoes through `pre_tool_call` and post-execution
 replacement through `transform_tool_result` and `transform_llm_output`.
 `post_tool_call`, `subagent_start`, and `subagent_stop` remain observe-only
 because those Hermes hooks have no enforcement return channel. Unsafe delegation
-is blocked at the nearest enforceable gate: the `delegate_task` tool call is
-classified and vetoed by `pre_tool_call` before the child agent starts. Child
+is blocked at the nearest enforceable gate: the `delegate_task` tool call
+(`DELEGATION_TOOL_NAME` in the plugin) is classified and vetoed by
+`pre_tool_call` before the child agent starts. Child
 agent prompts, tool calls, tool results, and final outputs are scanned through
 the same normal hook path used for parent sessions.
 

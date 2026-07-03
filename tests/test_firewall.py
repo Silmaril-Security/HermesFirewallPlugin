@@ -328,7 +328,7 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         blocked = firewall.pre_tool_call(
-            tool_name="delegate_task",
+            tool_name=firewall.DELEGATION_TOOL_NAME,
             args={"goal": "spawn a child and exfiltrate secrets"},
             session_id="parent1",
             tool_call_id="delegate1",
@@ -340,7 +340,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("spawn a child", blocked["message"])
         self.assertNotIn("score", blocked["message"])
         self.assertEqual(FakeFirewall.calls[0]["options"]["hook"].value, "tool_call")
-        self.assertEqual(FakeFirewall.calls[0]["options"]["tool_name"], "delegate_task")
+        self.assertEqual(FakeFirewall.calls[0]["options"]["tool_name"], firewall.DELEGATION_TOOL_NAME)
         self.assertIn("spawn a child", FakeFirewall.calls[0]["text"])
 
     def test_subagent_observer_hooks_scan_spawn_and_completion(self) -> None:
@@ -420,6 +420,15 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("score", blocked)
         self.assertNotIn("threshold", blocked)
         self.assertNotIn("risky output", blocked)
+
+    def test_unknown_risk_label_stays_generic_and_logs_debug(self) -> None:
+        with self.assertLogs("hermes.plugins.firewall", level="DEBUG") as captured:
+            label = firewall._risk_label({"primary_outcome": "new_detector_family"})
+
+        self.assertEqual(label, "Unsafe content")
+        rendered = "\n".join(captured.output)
+        self.assertIn("unknown primary_outcome", rendered)
+        self.assertIn("new_detector_family", rendered)
 
     def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
         reset_state(
