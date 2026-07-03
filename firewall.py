@@ -228,6 +228,10 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         "toolName": _metadata_value(fields.get("tool_name")),
         "model": _metadata_value(fields.get("model")),
         "platform": _metadata_value(fields.get("platform")),
+        "childSessionId": _metadata_value(fields.get("child_session_id")),
+        "childSubagentId": _metadata_value(fields.get("child_subagent_id")),
+        "childRole": _metadata_value(fields.get("child_role")),
+        "parentTurnId": _metadata_value(fields.get("parent_turn_id")),
     }
 
 
@@ -255,17 +259,15 @@ def _classify(
         )
         result_dict = _result_dict(result)
         LOGGER.info(
-            "[%s] sdk_result event=%s hook=%s tool_name=%s tool_call_id=%s prediction=%s score=%s threshold=%s primary_outcome=%s output=%s",
+            "[%s] sdk_result event=%s hook=%s tool_name=%s tool_call_id=%s prediction=%s risk=%s blocked=%s",
             PLUGIN_NAME,
             event,
             hook.value,
             tool_name or "-",
             (metadata or {}).get("toolCallId") or "-",
             result_dict.get("prediction"),
-            result_dict.get("score"),
-            result_dict.get("threshold"),
-            result_dict.get("primary_outcome"),
-            json.dumps(result_dict, ensure_ascii=False, sort_keys=True),
+            _risk_label(result_dict),
+            result_dict.get("blocked"),
         )
         return result_dict
     except Exception as exc:
@@ -319,17 +321,45 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
 
 
 def _block_message(result: Mapping[str, Any], subject: str) -> str:
-    parts = [f"Silmaril Firewall classified this {subject} as malicious"]
-    primary_outcome = result.get("primary_outcome")
-    score = result.get("score")
-    threshold = result.get("threshold")
-    if primary_outcome:
-        parts.append(f"primary_outcome={primary_outcome}")
-    if isinstance(score, (int, float)):
-        parts.append(f"score={score}")
-    if isinstance(threshold, (int, float)):
-        parts.append(f"threshold={threshold}")
-    return "; ".join(parts)
+    risk = _risk_label(result)
+    return (
+        f"Silmaril Firewall blocked this {subject}: {risk}. "
+        "Continue without using the blocked content."
+    )
+
+
+def _risk_label(result: Mapping[str, Any]) -> str:
+    outcome = result.get("primary_outcome")
+    normalized = outcome.strip().lower() if isinstance(outcome, str) else ""
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    labels = {
+        "prompt_injection": "Unsafe agent control attempt",
+        "control_abuse": "Unsafe agent control attempt",
+        "information_disclosure": "Sensitive information exposure",
+        "secret_exposure": "Sensitive information exposure",
+        "system_compromise": "Potential system compromise",
+        "service_disruption": "Service disruption risk",
+        "data_exfiltration": "Sensitive data exfiltration risk",
+    }
+    return labels.get(normalized, "Unsafe content")
+
+
+def _surface_label(event: str, fields: Mapping[str, Any], hook_name: str) -> str:
+    tool_name = fields.get("tool_name")
+    tool_part = f" ({tool_name})" if isinstance(tool_name, str) and tool_name not in {"", "-"} else ""
+    if event in {"pre_llm_call"}:
+        return "parent or child prompt"
+    if event == "pre_tool_call":
+        return f"tool call{tool_part}"
+    if event in {"post_tool_call", "transform_tool_result"}:
+        return f"tool result{tool_part}"
+    if event == "transform_llm_output":
+        return "final assistant output"
+    if event == "subagent_start":
+        return "subagent start request"
+    if event == "subagent_stop":
+        return "subagent final output"
+    return hook_name.lower().replace("_", " ")
 
 
 def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
@@ -345,30 +375,17 @@ def _blocked_replacement(
     hook_name: str,
     result: Mapping[str, Any],
 ) -> str:
-    replacement = {
-        "silmarilFirewall": {
-            "blocked": True,
-            "hook": hook_name,
-            "hermesHookEvent": event,
-            "toolName": _metadata_value(fields.get("tool_name")),
-            "toolCallId": _metadata_value(fields.get("tool_call_id")),
-            "reason": _block_message(result, "content"),
-            "classification": {
-                "prediction": result.get("prediction"),
-                "score": result.get("score"),
-                "threshold": result.get("threshold"),
-                "primary_outcome": result.get("primary_outcome"),
-                "outcome_scores": result.get("outcome_scores") or {},
-                "detector_scores": result.get("detector_scores") or {},
-                "detector_counts": result.get("detector_counts") or {},
-            },
-        },
-    }
-    return (
-        "Silmaril Firewall blocked malicious content before downstream model consumption:\n```json\n"
-        + json.dumps(replacement, ensure_ascii=False, sort_keys=True, indent=2)
-        + "\n```"
-    )
+    surface = _surface_label(event, fields, hook_name)
+    risk = _risk_label(result)
+    lines = [
+        "Silmaril Firewall blocked unsafe content.",
+        "",
+        f"Surface: {surface}.",
+        f"Reason: {risk}.",
+        "Action: The unsafe content was replaced before downstream model consumption.",
+        "Next step: Continue without using or repeating the blocked content.",
+    ]
+    return "\n".join(lines)
 
 
 def pre_llm_call(
@@ -523,6 +540,62 @@ def transform_llm_output(
     return response_text
 
 
+def subagent_start(
+    parent_session_id: str = "",
+    child_session_id: str = "",
+    child_subagent_id: str = "",
+    child_role: str = "",
+    child_goal: str = "",
+    parent_turn_id: str = "",
+    **kwargs: Any,
+) -> None:
+    """Observe subagent launches. Hermes treats this hook as visibility-only."""
+    fields = {
+        "session_id": parent_session_id or "-",
+        "child_session_id": child_session_id or "-",
+        "child_subagent_id": child_subagent_id or "-",
+        "child_role": child_role or "-",
+        "parent_turn_id": parent_turn_id or "-",
+        "goal_chars": _safe_len(child_goal),
+    }
+    _observe(
+        "subagent_start",
+        fields,
+        "USER_INPUT",
+        child_goal,
+    )
+    return None
+
+
+def subagent_stop(
+    parent_session_id: str = "",
+    child_session_id: str = "",
+    child_subagent_id: str = "",
+    child_role: str = "",
+    child_summary: str = "",
+    child_status: str = "",
+    parent_turn_id: str = "",
+    **kwargs: Any,
+) -> None:
+    """Observe subagent completion. Enforcement stays in normal child hooks."""
+    fields = {
+        "session_id": parent_session_id or "-",
+        "child_session_id": child_session_id or "-",
+        "child_subagent_id": child_subagent_id or "-",
+        "child_role": child_role or "-",
+        "child_status": child_status or "-",
+        "parent_turn_id": parent_turn_id or "-",
+        "summary_chars": _safe_len(child_summary),
+    }
+    _observe(
+        "subagent_stop",
+        fields,
+        "LLM_OUTPUT",
+        child_summary,
+    )
+    return None
+
+
 def register(ctx: Any) -> None:
     """Register pass-through firewall hooks with Hermes."""
     ctx.register_hook("pre_llm_call", pre_llm_call)
@@ -530,4 +603,6 @@ def register(ctx: Any) -> None:
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("transform_llm_output", transform_llm_output)
+    ctx.register_hook("subagent_start", subagent_start)
+    ctx.register_hook("subagent_stop", subagent_stop)
     LOGGER.info("[%s] registered pass-through hooks", PLUGIN_NAME)
