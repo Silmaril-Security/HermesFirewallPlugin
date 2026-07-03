@@ -416,7 +416,7 @@ class HermesFirewallTests(unittest.TestCase):
 
         blocked = firewall.transform_tool_result(tool_name="terminal", result="risky output")
         self.assertIn("Silmaril Firewall blocked unsafe content.", blocked)
-        self.assertIn("Reason: Unsafe content.", blocked)
+        self.assertIn("Reason: Unexpected classification conflict.", blocked)
         self.assertNotIn("score", blocked)
         self.assertNotIn("threshold", blocked)
         self.assertNotIn("risky output", blocked)
@@ -429,6 +429,9 @@ class HermesFirewallTests(unittest.TestCase):
         rendered = "\n".join(captured.output)
         self.assertIn("unknown primary_outcome", rendered)
         self.assertIn("new_detector_family", rendered)
+
+    def test_benign_risk_label_is_not_treated_as_unknown(self) -> None:
+        self.assertEqual(firewall._risk_label({"primary_outcome": "benign"}), "No flagged risk")
 
     def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
         reset_state(

@@ -333,6 +333,8 @@ def _risk_label(result: Mapping[str, Any]) -> str:
     outcome = result.get("primary_outcome")
     normalized = outcome.strip().lower() if isinstance(outcome, str) else ""
     normalized = normalized.replace("-", "_").replace(" ", "_")
+    if normalized == "benign":
+        return "Unexpected classification conflict" if _is_malicious(result) else "No flagged risk"
     labels = {
         "prompt_injection": "Unsafe agent control attempt",
         "control_abuse": "Unsafe agent control attempt",
