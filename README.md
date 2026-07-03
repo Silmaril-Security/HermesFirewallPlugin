@@ -43,13 +43,15 @@ hermes gateway restart
 
 ## Behavior
 
-The plugin registers five hooks:
+The plugin registers seven hooks:
 
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when `HERMES_FIREWALL_BLOCK_MALICIOUS=true` and the classifier returns a malicious result.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
 - `transform_tool_result` classifies the tool result with `HookLabel.TOOL_RESPONSE`, then returns the original result by default or a safe replacement when blocking is enabled and the result is malicious.
 - `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT`, then returns the original response by default or a safe replacement when blocking is enabled and the output is malicious.
+- `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
+- `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
 The SDK client is created with `shadow_mode=True`, so classification output is
 logged without relying on SDK exceptions for control flow. SDK import,
@@ -57,10 +59,11 @@ configuration, network, API, malformed payload, empty payload, and classificatio
 failures are logged and fail open.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
-label, tool name, tool call id when present, `prediction`, `score`, `threshold`,
-computed `blocked`, `primary_outcome`, `outcome_scores`, `detector_scores`, and
-`detector_counts`. Raw prompts, tool arguments, tool outputs, and assistant text
-are not emitted in structured logs or model-visible context.
+label, tool name, tool call id when present, prediction, readable risk category,
+and whether the SDK classified the event as blocked. Raw prompts, tool
+arguments, tool outputs, assistant text, classifier scores, thresholds, detector
+maps, and raw decision JSON are not emitted in structured logs or model-visible
+context.
 
 Required environment variables:
 
@@ -83,7 +86,13 @@ state.
 
 Hermes supports pre-execution vetoes through `pre_tool_call` and post-execution
 replacement through `transform_tool_result` and `transform_llm_output`.
-`post_tool_call` remains observe-only because it has no return channel.
+`post_tool_call`, `subagent_start`, and `subagent_stop` remain observe-only
+because those Hermes hooks have no enforcement return channel. Unsafe delegation
+is blocked at the nearest enforceable gate: the `delegate_task` tool call
+(`DELEGATION_TOOL_NAME` in the plugin) is classified and vetoed by
+`pre_tool_call` before the child agent starts. Child
+agent prompts, tool calls, tool results, and final outputs are scanned through
+the same normal hook path used for parent sessions.
 
 Default behavior is pass-through:
 
@@ -98,18 +107,16 @@ HERMES_FIREWALL_BLOCK_MALICIOUS=true
 ```
 
 When enabled, malicious `pre_tool_call` classifications return the Hermes veto
-shape:
+shape with readable copy:
 
-```json
-{
-  "action": "block",
-  "message": "Silmaril Firewall classified this tool call as malicious; primary_outcome=control_abuse; score=0.99; threshold=0.5"
-}
+```text
+Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.
 ```
 
 Malicious transform-hook classifications return a safe replacement string with
-the hook, tool id when present, score, threshold, and primary outcome. The
-replacement does not include the original tool output or assistant text.
+surface, reason, action, and next step. The replacement does not include raw
+classifier JSON, scores, thresholds, detector maps, original tool output, or
+assistant text.
 
 ## Public Demo
 

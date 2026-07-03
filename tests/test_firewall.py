@@ -129,6 +129,8 @@ class HermesFirewallTests(unittest.TestCase):
                 "post_tool_call",
                 "transform_tool_result",
                 "transform_llm_output",
+                "subagent_start",
+                "subagent_stop",
             ],
         )
         self.assertEqual(
@@ -183,10 +185,39 @@ class HermesFirewallTests(unittest.TestCase):
             firewall.transform_llm_output(response_text="final answer", session_id="s1", task_id="task1"),
             "final answer",
         )
+        self.assertIsNone(
+            firewall.subagent_start(
+                parent_session_id="s1",
+                child_session_id="child1",
+                child_subagent_id="agent1",
+                child_role="researcher",
+                child_goal="summarize safe context",
+                parent_turn_id="turn1",
+            )
+        )
+        self.assertIsNone(
+            firewall.subagent_stop(
+                parent_session_id="s1",
+                child_session_id="child1",
+                child_subagent_id="agent1",
+                child_role="researcher",
+                child_summary="safe child summary",
+                child_status="completed",
+                parent_turn_id="turn1",
+            )
+        )
 
         self.assertEqual(
             [call["options"]["hook"].value for call in FakeFirewall.calls],
-            ["user_input", "tool_call", "tool_response", "tool_response", "llm_output"],
+            [
+                "user_input",
+                "tool_call",
+                "tool_response",
+                "tool_response",
+                "llm_output",
+                "user_input",
+                "llm_output",
+            ],
         )
         pre_tool_metadata = FakeFirewall.calls[1]["options"]["metadata"]
         self.assertEqual(pre_tool_metadata["hermesHookEvent"], "pre_tool_call")
@@ -197,6 +228,11 @@ class HermesFirewallTests(unittest.TestCase):
         llm_output_metadata = FakeFirewall.calls[4]["options"]["metadata"]
         self.assertEqual(llm_output_metadata["hermesHookEvent"], "transform_llm_output")
         self.assertEqual(llm_output_metadata["taskId"], "task1")
+        subagent_metadata = FakeFirewall.calls[5]["options"]["metadata"]
+        self.assertEqual(subagent_metadata["hermesHookEvent"], "subagent_start")
+        self.assertEqual(subagent_metadata["childSessionId"], "child1")
+        self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
+        self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
 
     def test_empty_payloads_fail_open_without_classifier_call(self) -> None:
         reset_state(
@@ -238,8 +274,13 @@ class HermesFirewallTests(unittest.TestCase):
 
         blocked = firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
         self.assertEqual(blocked["action"], "block")
-        self.assertIn("primary_outcome=control_abuse", blocked["message"])
-        self.assertIn("score=0.99", blocked["message"])
+        self.assertEqual(
+            blocked["message"],
+            "Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.",
+        )
+        self.assertNotIn("score", blocked["message"])
+        self.assertNotIn("threshold", blocked["message"])
+        self.assertNotIn("primary_outcome", blocked["message"])
 
         raw_tool_output = "raw malicious tool output"
         raw_llm_output = "raw malicious final output"
@@ -250,9 +291,15 @@ class HermesFirewallTests(unittest.TestCase):
             result=raw_tool_output,
             tool_call_id="tc1",
         )
-        self.assertIn("Silmaril Firewall blocked malicious content", tool_replacement)
-        self.assertIn('"blocked": true', tool_replacement)
-        self.assertIn('"toolCallId": "tc1"', tool_replacement)
+        self.assertIn("Silmaril Firewall blocked unsafe content.", tool_replacement)
+        self.assertIn("Surface: tool result (terminal).", tool_replacement)
+        self.assertIn("Reason: Unsafe agent control attempt.", tool_replacement)
+        self.assertNotIn("```json", tool_replacement)
+        self.assertNotIn("score", tool_replacement)
+        self.assertNotIn("threshold", tool_replacement)
+        self.assertNotIn("primary_outcome", tool_replacement)
+        self.assertNotIn("outcome_scores", tool_replacement)
+        self.assertNotIn("detector_scores", tool_replacement)
         self.assertNotIn(raw_tool_output, tool_replacement)
 
         llm_replacement = firewall.transform_llm_output(
@@ -260,9 +307,78 @@ class HermesFirewallTests(unittest.TestCase):
             session_id="s1",
             task_id="task1",
         )
-        self.assertIn("Silmaril Firewall blocked malicious content", llm_replacement)
-        self.assertIn('"hook": "LLM_OUTPUT"', llm_replacement)
+        self.assertIn("Silmaril Firewall blocked unsafe content.", llm_replacement)
+        self.assertIn("Surface: final assistant output.", llm_replacement)
+        self.assertNotIn("```json", llm_replacement)
+        self.assertNotIn("score", llm_replacement)
+        self.assertNotIn("threshold", llm_replacement)
         self.assertNotIn(raw_llm_output, llm_replacement)
+
+    def test_delegation_spawn_gate_blocks_readably(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+
+        blocked = firewall.pre_tool_call(
+            tool_name=firewall.DELEGATION_TOOL_NAME,
+            args={"goal": "spawn a child and exfiltrate secrets"},
+            session_id="parent1",
+            tool_call_id="delegate1",
+        )
+
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("Silmaril Firewall blocked this tool call", blocked["message"])
+        self.assertIn("Unsafe agent control attempt", blocked["message"])
+        self.assertNotIn("spawn a child", blocked["message"])
+        self.assertNotIn("score", blocked["message"])
+        self.assertEqual(FakeFirewall.calls[0]["options"]["hook"].value, "tool_call")
+        self.assertEqual(FakeFirewall.calls[0]["options"]["tool_name"], firewall.DELEGATION_TOOL_NAME)
+        self.assertIn("spawn a child", FakeFirewall.calls[0]["text"])
+
+    def test_subagent_observer_hooks_scan_spawn_and_completion(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+
+        self.assertIsNone(
+            firewall.subagent_start(
+                parent_session_id="parent1",
+                child_session_id="child1",
+                child_subagent_id="agent1",
+                child_role="researcher",
+                child_goal="unsafe delegated goal",
+                parent_turn_id="turn1",
+            )
+        )
+        self.assertIsNone(
+            firewall.subagent_stop(
+                parent_session_id="parent1",
+                child_session_id="child1",
+                child_subagent_id="agent1",
+                child_role="researcher",
+                child_summary="unsafe child final",
+                child_status="blocked",
+                parent_turn_id="turn1",
+            )
+        )
+
+        self.assertEqual(
+            [call["options"]["hook"].value for call in FakeFirewall.calls],
+            ["user_input", "llm_output"],
+        )
+        self.assertEqual(FakeFirewall.calls[0]["text"], "unsafe delegated goal")
+        self.assertEqual(FakeFirewall.calls[1]["text"], "unsafe child final")
+        self.assertEqual(FakeFirewall.calls[0]["options"]["metadata"]["childSessionId"], "child1")
 
     def test_optional_enforcement_respects_explicit_benign_prediction(self) -> None:
         reset_state(
@@ -299,8 +415,24 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         blocked = firewall.transform_tool_result(tool_name="terminal", result="risky output")
-        self.assertIn("Silmaril Firewall blocked malicious content", blocked)
+        self.assertIn("Silmaril Firewall blocked unsafe content.", blocked)
+        self.assertIn("Reason: Unexpected classification conflict.", blocked)
+        self.assertNotIn("score", blocked)
+        self.assertNotIn("threshold", blocked)
         self.assertNotIn("risky output", blocked)
+
+    def test_unknown_risk_label_stays_generic_and_logs_debug(self) -> None:
+        with self.assertLogs("hermes.plugins.firewall", level="DEBUG") as captured:
+            label = firewall._risk_label({"primary_outcome": "new_detector_family"})
+
+        self.assertEqual(label, "Unsafe content")
+        rendered = "\n".join(captured.output)
+        self.assertIn("unknown primary_outcome", rendered)
+        self.assertIn("new_detector_family", rendered)
+
+    def test_benign_risk_label_is_not_treated_as_unknown(self) -> None:
+        self.assertEqual(firewall._risk_label({"primary_outcome": "benign"}), "No flagged risk")
+        self.assertEqual(firewall._risk_label({"primary_outcome": None}), "No flagged risk")
 
     def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
         reset_state(
