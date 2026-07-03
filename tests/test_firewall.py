@@ -432,6 +432,7 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_benign_risk_label_is_not_treated_as_unknown(self) -> None:
         self.assertEqual(firewall._risk_label({"primary_outcome": "benign"}), "No flagged risk")
+        self.assertEqual(firewall._risk_label({"primary_outcome": None}), "No flagged risk")
 
     def test_optional_enforcement_respects_threshold_for_transform_output(self) -> None:
         reset_state(
