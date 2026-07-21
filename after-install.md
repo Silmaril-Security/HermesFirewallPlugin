@@ -19,7 +19,7 @@ HERMES_FIREWALL_BLOCK_MALICIOUS=true
 Install the SDK in the Hermes Python environment:
 
 ```bash
-pip install silmaril-security-sdk==0.4.2
+pip install silmaril-security-sdk==0.5.0
 ```
 
 Set `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes environment before

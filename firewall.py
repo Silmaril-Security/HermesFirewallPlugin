@@ -10,14 +10,16 @@ before downstream use.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+from collections import OrderedDict
 from typing import Any, Mapping
 
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.5.0"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -25,6 +27,8 @@ DEFAULT_MAX_COLLECTION_ITEMS = 50
 DELEGATION_TOOL_NAME = "delegate_task"
 _SDK_CLIENT: Any | None = None
 _SDK_CONFIG: tuple[str, str, float, int] | None = None
+_TOOL_RESULT_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
+_MAX_TOOL_RESULT_CACHE_ENTRIES = 256
 
 
 def _safe_len(value: Any) -> int:
@@ -92,8 +96,14 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
         max_chars = _max_payload_chars()
         if len(value) <= max_chars:
             return value
-        omitted = len(value) - max_chars
-        return f"{value[:max_chars]}...[truncated {omitted} chars]"
+        head_chars = max_chars // 2
+        tail_chars = max_chars - head_chars
+        omitted = len(value) - head_chars - tail_chars
+        return (
+            f"{value[:head_chars]}"
+            f"...[truncated {omitted} chars]..."
+            f"{value[-tail_chars:]}"
+        )
 
     if isinstance(value, bytes):
         return _json_safe(value.decode("utf-8", errors="replace"), depth=depth + 1)
@@ -180,6 +190,7 @@ def _firewall_client() -> Any:
         max_retries=max_retries,
     )
     _SDK_CONFIG = config
+    _TOOL_RESULT_CACHE.clear()
     return _SDK_CLIENT
 
 
@@ -191,14 +202,12 @@ def _log(event: str, **fields: Any) -> None:
 def _result_dict(result: Any) -> dict[str, Any]:
     score = getattr(result, "score", None)
     threshold = getattr(result, "threshold", None)
-    blocked = None
-    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
-        blocked = score >= threshold
+    prediction = getattr(result, "prediction", None)
     return {
-        "prediction": getattr(result, "prediction", None),
+        "prediction": prediction,
         "score": score,
         "threshold": threshold,
-        "blocked": blocked,
+        "blocked": prediction == "MALICIOUS",
         "primary_outcome": getattr(result, "primary_outcome", None),
         "outcome_scores": getattr(result, "outcome_scores", None),
         "detector_scores": getattr(result, "detector_scores", None),
@@ -217,19 +226,22 @@ def _metadata_value(value: Any) -> Any:
 
 
 def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
+    session_id = _metadata_value(fields.get("session_id"))
+    child_session_id = _metadata_value(fields.get("child_session_id"))
     return {
         "silmaril": {
             "integration": PLUGIN_NAME,
             "version": PLUGIN_VERSION,
         },
         "hermesHookEvent": event,
-        "sessionId": _metadata_value(fields.get("session_id")),
+        "conversationId": child_session_id or session_id,
+        "sessionId": session_id,
         "taskId": _metadata_value(fields.get("task_id")),
         "toolCallId": _metadata_value(fields.get("tool_call_id")),
         "toolName": _metadata_value(fields.get("tool_name")),
         "model": _metadata_value(fields.get("model")),
         "platform": _metadata_value(fields.get("platform")),
-        "childSessionId": _metadata_value(fields.get("child_session_id")),
+        "childSessionId": child_session_id,
         "childSubagentId": _metadata_value(fields.get("child_subagent_id")),
         "childRole": _metadata_value(fields.get("child_role")),
         "parentTurnId": _metadata_value(fields.get("parent_turn_id")),
@@ -251,12 +263,18 @@ def _classify(
         client = _firewall_client()
         _, HookLabel = _sdk_symbols()
         hook = getattr(HookLabel, hook_name)
+        classify_options = {
+            "hook": hook,
+            "tool_name": tool_name,
+            "metadata": metadata,
+            "shadow_mode": True,
+        }
+        request_id = _stable_request_id(event, metadata or {}, text)
+        if request_id is not None:
+            classify_options["request_id"] = request_id
         result = client.classify(
             text,
-            hook=hook,
-            tool_name=tool_name,
-            metadata=metadata,
-            shadow_mode=True,
+            **classify_options,
         )
         result_dict = _result_dict(result)
         LOGGER.info(
@@ -302,23 +320,67 @@ def _observe(
 
 
 def _is_malicious(result: Mapping[str, Any] | None) -> bool:
-    if result is None:
-        return False
-    prediction = result.get("prediction")
-    if isinstance(prediction, str):
-        normalized_prediction = prediction.lower()
-        if normalized_prediction == "benign":
-            return False
-    else:
-        normalized_prediction = ""
-    score = result.get("score")
-    threshold = result.get("threshold")
-    if isinstance(score, (int, float)) and isinstance(threshold, (int, float)):
-        return score >= threshold
-    if normalized_prediction == "malicious":
-        return True
-    blocked = result.get("blocked")
-    return bool(blocked) if isinstance(blocked, bool) else False
+    return result is not None and result.get("prediction") == "MALICIOUS"
+
+
+def _stable_request_id(
+    event: str,
+    metadata: Mapping[str, Any],
+    text: str,
+) -> str | None:
+    stable_event_id = (
+        metadata.get("toolCallId")
+        or metadata.get("taskId")
+        or metadata.get("parentTurnId")
+        or metadata.get("childSubagentId")
+    )
+    if not isinstance(stable_event_id, str) or not stable_event_id:
+        return None
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    logical_event = json.dumps(
+        {
+            "integration": PLUGIN_NAME,
+            "event": event,
+            "conversationId": metadata.get("conversationId"),
+            "stableEventId": stable_event_id,
+            "contentHash": content_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{PLUGIN_NAME}-{hashlib.sha256(logical_event.encode('utf-8')).hexdigest()}"
+
+
+def _tool_result_cache_key(fields: Mapping[str, Any], result: str) -> str:
+    logical_result = json.dumps(
+        {
+            "sessionId": fields.get("session_id"),
+            "taskId": fields.get("task_id"),
+            "toolCallId": fields.get("tool_call_id"),
+            "toolName": fields.get("tool_name"),
+            "contentHash": hashlib.sha256(result.encode("utf-8")).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(logical_result.encode("utf-8")).hexdigest()
+
+
+def _cached_tool_result(key: str) -> tuple[bool, dict[str, Any] | None]:
+    if key not in _TOOL_RESULT_CACHE:
+        return False, None
+    value = _TOOL_RESULT_CACHE[key]
+    _TOOL_RESULT_CACHE.move_to_end(key)
+    return True, value
+
+
+def _store_tool_result(key: str, value: dict[str, Any] | None) -> None:
+    if value is None:
+        return
+    _TOOL_RESULT_CACHE[key] = value
+    _TOOL_RESULT_CACHE.move_to_end(key)
+    while len(_TOOL_RESULT_CACHE) > _MAX_TOOL_RESULT_CACHE_ENTRIES:
+        _TOOL_RESULT_CACHE.popitem(last=False)
 
 
 def _block_message(result: Mapping[str, Any], subject: str) -> str:
@@ -480,13 +542,19 @@ def post_tool_call(
         "duration_ms": duration_ms if duration_ms is not None else "-",
         "result_chars": _safe_len(result),
     }
-    _observe(
-        "post_tool_call",
-        fields,
-        "TOOL_RESPONSE",
-        result,
-        tool_name=tool_name or None,
-    )
+    cache_key = _tool_result_cache_key(fields, result)
+    cached, _ = _cached_tool_result(cache_key)
+    if not cached:
+        observed = _observe(
+            "post_tool_call",
+            fields,
+            "TOOL_RESPONSE",
+            result,
+            tool_name=tool_name or None,
+        )
+        _store_tool_result(cache_key, observed)
+    else:
+        _log("post_tool_call_reused", tool_call_id=tool_call_id or "-")
     return None
 
 
@@ -509,13 +577,19 @@ def transform_tool_result(
         "duration_ms": duration_ms if duration_ms is not None else "-",
         "result_chars": _safe_len(result),
     }
-    observed = _observe(
-        "transform_tool_result",
-        fields,
-        "TOOL_RESPONSE",
-        result,
-        tool_name=tool_name or None,
-    )
+    cache_key = _tool_result_cache_key(fields, result)
+    cached, observed = _cached_tool_result(cache_key)
+    if not cached:
+        observed = _observe(
+            "transform_tool_result",
+            fields,
+            "TOOL_RESPONSE",
+            result,
+            tool_name=tool_name or None,
+        )
+        _store_tool_result(cache_key, observed)
+    else:
+        _log("transform_tool_result_reused", tool_call_id=tool_call_id or "-")
     if _block_malicious() and _is_malicious(observed):
         return _blocked_replacement(
             "transform_tool_result",
