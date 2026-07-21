@@ -18,7 +18,7 @@ The plugin requires the Silmaril Security SDK in the same Python environment
 that runs Hermes:
 
 ```bash
-pip install silmaril-security-sdk==0.4.2
+pip install silmaril-security-sdk==0.5.0
 ```
 
 Copy `.env.example` into your Hermes environment manager or shell profile and
@@ -48,7 +48,7 @@ The plugin registers seven hooks:
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when `HERMES_FIREWALL_BLOCK_MALICIOUS=true` and the classifier returns a malicious result.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
-- `transform_tool_result` classifies the tool result with `HookLabel.TOOL_RESPONSE`, then returns the original result by default or a safe replacement when blocking is enabled and the result is malicious.
+- `transform_tool_result` reuses the matching `post_tool_call` classification, then returns the original result by default or a safe replacement when blocking is enabled and the result is malicious.
 - `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT`, then returns the original response by default or a safe replacement when blocking is enabled and the output is malicious.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
@@ -57,6 +57,14 @@ The SDK client is created with `shadow_mode=True`, so classification output is
 logged without relying on SDK exceptions for control flow. SDK import,
 configuration, network, API, malformed payload, empty payload, and classification
 failures are logged and fail open.
+
+Only the exact prediction `MALICIOUS` is enforceable. Scores, thresholds,
+outcomes, missing predictions, and unknown predictions remain diagnostic. A
+matching post/transform tool callback pair makes one SDK request, and changed
+content receives a distinct content-sensitive identity. Child lifecycle events
+use the child session as their conversation identity; other events use the
+normal Hermes session. Large strings preserve both their head and tail when
+sanitized for classification.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
 label, tool name, tool call id when present, prediction, readable risk category,
