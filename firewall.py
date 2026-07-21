@@ -341,6 +341,7 @@ def _stable_request_id(
         {
             "integration": PLUGIN_NAME,
             "event": event,
+            "conversationId": metadata.get("conversationId"),
             "stableEventId": stable_event_id,
             "contentHash": content_hash,
         },
@@ -374,6 +375,8 @@ def _cached_tool_result(key: str) -> tuple[bool, dict[str, Any] | None]:
 
 
 def _store_tool_result(key: str, value: dict[str, Any] | None) -> None:
+    if value is None:
+        return
     _TOOL_RESULT_CACHE[key] = value
     _TOOL_RESULT_CACHE.move_to_end(key)
     while len(_TOOL_RESULT_CACHE) > _MAX_TOOL_RESULT_CACHE_ENTRIES:

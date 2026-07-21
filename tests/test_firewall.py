@@ -425,10 +425,18 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertTrue(firewall._is_malicious({"prediction": "MALICIOUS", "score": 0.0}))
 
     def test_request_identity_is_retry_stable_and_content_sensitive(self) -> None:
-        metadata = {"toolCallId": "tool-1"}
+        metadata = {"conversationId": "session-1", "toolCallId": "tool-1"}
         first = firewall._stable_request_id("pre_tool_call", metadata, "one")
         self.assertEqual(first, firewall._stable_request_id("pre_tool_call", metadata, "one"))
         self.assertNotEqual(first, firewall._stable_request_id("pre_tool_call", metadata, "two"))
+        self.assertNotEqual(
+            first,
+            firewall._stable_request_id(
+                "pre_tool_call",
+                {**metadata, "conversationId": "session-2"},
+                "one",
+            ),
+        )
         self.assertIsNone(firewall._stable_request_id("pre_llm_call", {}, "one"))
 
     def test_head_and_tail_sanitization_preserves_both_boundaries(self) -> None:
@@ -458,6 +466,42 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("score", blocked)
         self.assertNotIn("threshold", blocked)
         self.assertNotIn("risky output", blocked)
+
+    def test_failed_tool_result_observation_is_not_cached(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.error = TimeoutError("transient classifier failure")
+
+        self.assertIsNone(
+            firewall.post_tool_call(
+                tool_name="terminal",
+                result="risky output",
+                session_id="s1",
+                tool_call_id="tc1",
+            )
+        )
+        self.assertEqual(len(FakeFirewall.calls), 1)
+
+        FakeFirewall.error = None
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.01,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        replacement = firewall.transform_tool_result(
+            tool_name="terminal",
+            result="risky output",
+            session_id="s1",
+            tool_call_id="tc1",
+        )
+
+        self.assertEqual(len(FakeFirewall.calls), 2)
+        self.assertIn("Silmaril Firewall blocked unsafe content.", replacement)
+        self.assertNotIn("risky output", replacement)
 
     def test_unknown_risk_label_stays_generic_and_logs_debug(self) -> None:
         with self.assertLogs("hermes.plugins.firewall", level="DEBUG") as captured:
