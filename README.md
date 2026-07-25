@@ -73,6 +73,24 @@ arguments, tool outputs, assistant text, classifier scores, thresholds, detector
 maps, and raw decision JSON are not emitted in structured logs or model-visible
 context.
 
+Every completed classification also writes one bounded `LocalProtectionEventV1` JSON
+record to the private local evidence spool. The record contains only redacted
+metadata, opaque request/session fingerprints, decision facts, native action,
+and plugin provenance. It never contains raw prompts, arguments, results,
+assistant output, credentials, detector maps, or error bodies. Events always
+report `outcome=not_observed`. Allowed and monitored actions report
+`evidenceTruth=plugin_reported`; returned Hermes blocks and replacements report
+`evidenceTruth=native_response_returned`. Neither value claims the downstream
+consequence was independently prevented.
+
+Writes are synchronous, per-event, and atomic, with `0700` directory and `0600`
+file permissions. Evidence failures log only the error type and never change
+the Hermes hook return value. By default the plugin writes directly to:
+
+```text
+~/Library/Application Support/Silmaril/Evidence/incoming
+```
+
 Required environment variables:
 
 - `SILMARIL_API_KEY`: API key for the Silmaril Firewall classify API.
@@ -84,6 +102,7 @@ Optional environment variables:
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
 - `HERMES_FIREWALL_BLOCK_MALICIOUS` enables optional blocking at supported pre-tool and transform boundaries. Default: `false`.
+- `SILMARIL_LOCAL_EVENT_DIR` directly overrides the incoming evidence directory. It is primarily intended for testing and nonstandard installations.
 
 Configuration precedence is Hermes-native and environment-based: the hook reads
 the process environment used by Hermes at call time. There is no local config

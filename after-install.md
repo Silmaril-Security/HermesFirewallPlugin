@@ -8,6 +8,12 @@ Security SDK. SDK output is logged for each call without raw classified text.
 SDK failures are logged and fail open. Default behavior does not block tools,
 inject context, or rewrite tool results.
 
+Hook decisions are also written as private, bounded `LocalProtectionEventV1`
+records under `~/Library/Application Support/Silmaril/Evidence/incoming`.
+These records contain redacted metadata only and never claim a real-world
+outcome was verified. Set `SILMARIL_LOCAL_EVENT_DIR` only when the incoming
+directory must be overridden.
+
 Optional enforcement is available at Hermes boundaries that can act on content:
 `pre_tool_call` can veto execution, while `transform_tool_result` and
 `transform_llm_output` can replace malicious content before downstream use:

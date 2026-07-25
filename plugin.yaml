@@ -1,6 +1,6 @@
 manifest_version: 1
 name: hermes-firewall
-version: 0.5.0
+version: 0.5.1
 license: Apache-2.0
 description: Fail-open Silmaril SDK firewall hooks for Hermes with readable opt-in enforcement.
 provides_hooks:
@@ -26,3 +26,5 @@ optional_env:
     description: SDK retry count. Defaults to 0.
   - name: HERMES_FIREWALL_MAX_PAYLOAD_CHARS
     description: Maximum classified payload length. Defaults to 8000 characters.
+  - name: SILMARIL_LOCAL_EVENT_DIR
+    description: Direct override for the private LocalProtectionEventV1 incoming directory.
