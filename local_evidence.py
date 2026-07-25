@@ -7,6 +7,7 @@ It never serializes raw prompts, arguments, tool results, or model output.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -200,7 +201,17 @@ def write_local_protection_event(
         destination.chmod(0o600)
         directory_descriptor = os.open(directory, os.O_RDONLY)
         try:
-            os.fsync(directory_descriptor)
+            try:
+                os.fsync(directory_descriptor)
+            except OSError as error:
+                unsupported = {
+                    errno.EBADF,
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", errno.EINVAL),
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error.errno not in unsupported:
+                    raise
         finally:
             os.close(directory_descriptor)
         return destination

@@ -73,14 +73,15 @@ arguments, tool outputs, assistant text, classifier scores, thresholds, detector
 maps, and raw decision JSON are not emitted in structured logs or model-visible
 context.
 
-Every hook invocation also writes one bounded `LocalProtectionEventV1` JSON
+Every completed classification also writes one bounded `LocalProtectionEventV1` JSON
 record to the private local evidence spool. The record contains only redacted
 metadata, opaque request/session fingerprints, decision facts, native action,
 and plugin provenance. It never contains raw prompts, arguments, results,
 assistant output, credentials, detector maps, or error bodies. Events always
-report `outcome=not_observed` and `evidenceTruth=plugin_reported`; a returned
-Hermes block or replacement is not presented as proof that the downstream
-consequence was prevented.
+report `outcome=not_observed`. Allowed and monitored actions report
+`evidenceTruth=plugin_reported`; returned Hermes blocks and replacements report
+`evidenceTruth=native_response_returned`. Neither value claims the downstream
+consequence was independently prevented.
 
 Writes are synchronous, per-event, and atomic, with `0700` directory and `0600`
 file permissions. Evidence failures log only the error type and never change

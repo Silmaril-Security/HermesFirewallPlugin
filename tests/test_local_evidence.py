@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import stat
@@ -224,6 +225,22 @@ class LocalEvidenceTests(unittest.TestCase):
                     )
 
             self.assertEqual(list(directory.iterdir()), [])
+
+    def test_atomic_writer_accepts_unsupported_directory_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "incoming"
+            event = self._event()
+            with mock.patch(
+                "local_evidence.os.fsync",
+                side_effect=[None, OSError(errno.EINVAL, "unsupported")],
+            ):
+                destination = local_evidence.write_local_protection_event(
+                    event,
+                    {"SILMARIL_LOCAL_EVENT_DIR": str(directory)},
+                )
+
+            self.assertTrue(destination.is_file())
+            self.assertEqual(json.loads(destination.read_text()), event)
 
     def _event(self) -> dict[str, object]:
         return local_evidence.build_local_protection_event(
