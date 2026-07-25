@@ -32,6 +32,9 @@ DEFAULT_EVENT_DIRECTORY_COMPONENTS = (
 )
 
 _SAFE_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._:/-]{0,63}$")
+_RUNTIME_CHECK_MARKER = re.compile(
+    r"\bsilmaril-runtime-check:[A-Za-z0-9-]{16,128}\b"
+)
 _SENSITIVE_TOOL_NAME = re.compile(
     r"(?:secret|token|credential|password|api[_-]?key|"
     r"sk-[a-z0-9_-]{8,}|akia[0-9a-z]{12,})",
@@ -108,7 +111,11 @@ def build_local_protection_event(
         "policyDecision": policy_decision,
         "nativeAction": native_action,
         "outcome": "not_observed",
-        "evidenceTruth": "plugin_reported",
+        "evidenceTruth": (
+            "native_response_returned"
+            if native_action in {"block_returned", "content_replaced"}
+            else "plugin_reported"
+        ),
         "evidenceCompleteness": "partial",
         "provenance": {
             "schemaVersion": PROVENANCE_SCHEMA_VERSION,
@@ -305,6 +312,11 @@ def _request_fingerprint(
     request_identity: str | None,
     raw_text: str,
 ) -> str:
+    runtime_check = _RUNTIME_CHECK_MARKER.search(raw_text)
+    if runtime_check:
+        return hashlib.sha256(
+            runtime_check.group(0).encode("utf-8")
+        ).hexdigest()
     content_digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     return _fingerprint(
         "request",

@@ -241,7 +241,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.5.0")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.5.1")
         self.assertRegex(
             FakeFirewall.calls[1]["options"]["request_id"],
             r"^hermes-firewall-[a-f0-9]{64}$",
@@ -281,6 +281,76 @@ class HermesFirewallTests(unittest.TestCase):
 
         self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"}))
 
+    def test_shadow_mode_preserves_every_supported_boundary(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        tool_args = {"command": "unsafe"}
+        original_tool_args = dict(tool_args)
+
+        self.assertIsNone(
+            firewall.pre_llm_call(
+                user_message="unsafe prompt",
+                session_id="session-1",
+            )
+        )
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args=tool_args,
+                session_id="session-1",
+                tool_call_id="call-1",
+            )
+        )
+        self.assertIsNone(
+            firewall.post_tool_call(
+                tool_name="terminal",
+                args=tool_args,
+                result="unsafe result",
+                session_id="session-1",
+                tool_call_id="call-1",
+            )
+        )
+        self.assertEqual(
+            firewall.transform_tool_result(
+                tool_name="terminal",
+                args=tool_args,
+                result="unsafe result",
+                session_id="session-1",
+                tool_call_id="call-1",
+            ),
+            "unsafe result",
+        )
+        self.assertEqual(
+            firewall.transform_llm_output(
+                response_text="unsafe output",
+                session_id="session-1",
+            ),
+            "unsafe output",
+        )
+        self.assertIsNone(
+            firewall.subagent_start(
+                parent_session_id="session-1",
+                child_session_id="session-2",
+                child_goal="unsafe goal",
+            )
+        )
+        self.assertIsNone(
+            firewall.subagent_stop(
+                parent_session_id="session-1",
+                child_session_id="session-2",
+                child_summary="unsafe summary",
+            )
+        )
+        self.assertEqual(tool_args, original_tool_args)
+
     def test_block_and_shadow_events_match_native_decisions_without_raw_data(self) -> None:
         raw_command = "RAW-COMMAND secret-value-123"
         raw_session = "customer-session-secret-456"
@@ -313,7 +383,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(block_event["policyDecision"], "block")
         self.assertEqual(block_event["nativeAction"], "block_returned")
         self.assertEqual(block_event["outcome"], "not_observed")
-        self.assertEqual(block_event["evidenceTruth"], "plugin_reported")
+        self.assertEqual(block_event["evidenceTruth"], "native_response_returned")
         self.assertEqual(block_event["evidenceCompleteness"], "partial")
         self.assertEqual(
             block_event["attemptedConsequence"]["category"],

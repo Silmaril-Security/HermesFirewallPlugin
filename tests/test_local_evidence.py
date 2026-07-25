@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import tempfile
@@ -38,7 +39,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="block",
             native_action="block_returned",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.0",
+            plugin_version="0.5.1",
             occurred_at=datetime(2026, 7, 24, 12, 34, 56, tzinfo=timezone.utc),
         )
 
@@ -87,13 +88,13 @@ class LocalEvidenceTests(unittest.TestCase):
         self.assertEqual(event["policyDecision"], "block")
         self.assertEqual(event["nativeAction"], "block_returned")
         self.assertEqual(event["outcome"], "not_observed")
-        self.assertEqual(event["evidenceTruth"], "plugin_reported")
+        self.assertEqual(event["evidenceTruth"], "native_response_returned")
         self.assertEqual(event["evidenceCompleteness"], "partial")
         self.assertEqual(event["provenance"], {
             "schemaVersion": 1,
             "producer": "hermes-firewall",
-            "producerVersion": "0.5.0",
-            "pluginVersion": "0.5.0",
+            "producerVersion": "0.5.1",
+            "pluginVersion": "0.5.1",
             "observedAt": "2026-07-24T12:34:56.000000Z",
         })
 
@@ -112,6 +113,33 @@ class LocalEvidenceTests(unittest.TestCase):
             local_evidence.MAX_LOCAL_PROTECTION_EVENT_BYTES,
         )
 
+    def test_repair_marker_has_stable_opaque_fingerprint(self) -> None:
+        marker = (
+            "silmaril-runtime-check:"
+            "bdfd6f09-7a38-4d0c-982b-961e2515eedc"
+        )
+        event = local_evidence.build_local_protection_event(
+            event="pre_llm_call",
+            hook="user_input",
+            mode="shadow",
+            raw_text=f"Reply with OK only. {marker}",
+            fields={},
+            classification={
+                "prediction": "BENIGN",
+                "primary_outcome": "benign",
+            },
+            policy_decision="allow",
+            native_action="allowed",
+            plugin_name="hermes-firewall",
+            plugin_version="0.5.1",
+        )
+        serialized = json.dumps(event, sort_keys=True)
+        self.assertEqual(
+            event["requestFingerprint"],
+            hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(marker, serialized)
+
     def test_prediction_scores_and_unknown_consequences_are_conservative(self) -> None:
         event = local_evidence.build_local_protection_event(
             event="transform_llm_output",
@@ -128,7 +156,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.0",
+            plugin_version="0.5.1",
             occurred_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
 
@@ -213,7 +241,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.0",
+            plugin_version="0.5.1",
             occurred_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
 
