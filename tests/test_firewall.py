@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import firewall
 
@@ -21,8 +25,10 @@ ENV_KEYS = {
     "HERMES_FIREWALL_MAX_PAYLOAD_CHARS",
     "HERMES_FIREWALL_SDK_MAX_RETRIES",
     "HERMES_FIREWALL_SDK_TIMEOUT_SECONDS",
+    "SILMARIL_LOCAL_EVENT_DIR",
     "SILMARIL_DEMO_BASE_URL",
 }
+TEST_EVIDENCE_DIRECTORIES: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,10 @@ def reset_state(**env: str) -> None:
     FakeFirewall.error = None
     for key in ENV_KEYS:
         os.environ.pop(key, None)
+    if "SILMARIL_LOCAL_EVENT_DIR" not in env:
+        evidence_directory = tempfile.mkdtemp(prefix="hermes-firewall-evidence-")
+        TEST_EVIDENCE_DIRECTORIES.append(evidence_directory)
+        env["SILMARIL_LOCAL_EVENT_DIR"] = evidence_directory
     os.environ.update(env)
     install_fake_sdk()
 
@@ -116,6 +126,9 @@ class HermesFirewallTests(unittest.TestCase):
         FakeFirewall.calls = []
         FakeFirewall.next_result = FakeResult()
         FakeFirewall.error = None
+        for directory in TEST_EVIDENCE_DIRECTORIES:
+            shutil.rmtree(directory, ignore_errors=True)
+        TEST_EVIDENCE_DIRECTORIES.clear()
 
     def test_registers_all_supported_pass_through_hooks(self) -> None:
         reset_state()
@@ -267,6 +280,119 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"}))
+
+    def test_block_and_shadow_events_match_native_decisions_without_raw_data(self) -> None:
+        raw_command = "RAW-COMMAND secret-value-123"
+        raw_session = "customer-session-secret-456"
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+
+        blocked = firewall.pre_tool_call(
+            tool_name="terminal",
+            args={"command": raw_command},
+            session_id=raw_session,
+            tool_call_id="tool-call-secret-789",
+        )
+        block_event_path = next(
+            Path(os.environ["SILMARIL_LOCAL_EVENT_DIR"]).glob("*.json")
+        )
+        block_event = json.loads(block_event_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(blocked["action"], "block")
+        self.assertEqual(block_event["mode"], "block")
+        self.assertEqual(block_event["prediction"], "malicious")
+        self.assertEqual(block_event["policyDecision"], "block")
+        self.assertEqual(block_event["nativeAction"], "block_returned")
+        self.assertEqual(block_event["outcome"], "not_observed")
+        self.assertEqual(block_event["evidenceTruth"], "plugin_reported")
+        self.assertEqual(block_event["evidenceCompleteness"], "partial")
+        self.assertEqual(
+            block_event["attemptedConsequence"]["category"],
+            "unsafe_agent_control",
+        )
+        serialized = json.dumps(block_event)
+        self.assertNotIn(raw_command, serialized)
+        self.assertNotIn(raw_session, serialized)
+        self.assertNotIn("tool-call-secret-789", serialized)
+
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": raw_command},
+                session_id=raw_session,
+                tool_call_id="tool-call-secret-789",
+            )
+        )
+        shadow_event_path = next(
+            Path(os.environ["SILMARIL_LOCAL_EVENT_DIR"]).glob("*.json")
+        )
+        shadow_event = json.loads(shadow_event_path.read_text(encoding="utf-8"))
+        self.assertEqual(shadow_event["mode"], "shadow")
+        self.assertEqual(shadow_event["prediction"], "malicious")
+        self.assertEqual(shadow_event["policyDecision"], "monitor")
+        self.assertEqual(shadow_event["nativeAction"], "allowed")
+        self.assertEqual(shadow_event["outcome"], "not_observed")
+
+    def test_evidence_failures_do_not_change_block_or_shadow_behavior(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        expected_block = firewall.pre_tool_call(
+            tool_name="terminal",
+            args={"command": "baseline command"},
+        )
+
+        with mock.patch.object(
+            firewall,
+            "_LOCAL_EVIDENCE_EMITTER",
+            side_effect=OSError("raw evidence failure detail"),
+        ):
+            with self.assertLogs(
+                "hermes.plugins.firewall",
+                level="WARNING",
+            ) as logs:
+                actual_block = firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": "baseline command"},
+                )
+            self.assertEqual(actual_block, expected_block)
+            self.assertNotIn("raw evidence failure detail", "\n".join(logs.output))
+
+            os.environ["HERMES_FIREWALL_BLOCK_MALICIOUS"] = "false"
+            self.assertIsNone(
+                firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": "baseline command"},
+                )
+            )
 
     def test_optional_enforcement_blocks_pre_tool_and_transform_outputs(self) -> None:
         reset_state(

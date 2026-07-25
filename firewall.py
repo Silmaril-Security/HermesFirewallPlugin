@@ -16,6 +16,17 @@ import os
 from collections import OrderedDict
 from typing import Any, Mapping
 
+try:
+    from .local_evidence import (
+        build_local_protection_event,
+        write_local_protection_event,
+    )
+except (ImportError, ValueError):
+    from local_evidence import (
+        build_local_protection_event,
+        write_local_protection_event,
+    )
+
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
@@ -29,6 +40,7 @@ _SDK_CLIENT: Any | None = None
 _SDK_CONFIG: tuple[str, str, float, int] | None = None
 _TOOL_RESULT_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
 _MAX_TOOL_RESULT_CACHE_ENTRIES = 256
+_LOCAL_EVIDENCE_EMITTER = write_local_protection_event
 
 
 def _safe_len(value: Any) -> int:
@@ -323,6 +335,65 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
     return result is not None and result.get("prediction") == "MALICIOUS"
 
 
+def _local_evidence_decision(
+    result: Mapping[str, Any] | None,
+    *,
+    block_enabled: bool,
+    block_action: str | None = None,
+    pass_action: str = "none",
+) -> tuple[str, str]:
+    if result is None:
+        policy_decision = "unavailable"
+    elif _is_malicious(result):
+        policy_decision = (
+            "block" if block_enabled and block_action is not None else "monitor"
+        )
+    else:
+        policy_decision = "allow"
+
+    native_action = (
+        block_action
+        if policy_decision == "block" and block_action is not None
+        else pass_action
+    )
+    return policy_decision, native_action
+
+
+def _record_local_evidence(
+    *,
+    event: str,
+    hook: str,
+    raw_text: str,
+    fields: Mapping[str, Any],
+    result: Mapping[str, Any] | None,
+    block_enabled: bool,
+    policy_decision: str,
+    native_action: str,
+) -> None:
+    try:
+        local_event = build_local_protection_event(
+            event=event,
+            hook=hook,
+            mode="block" if block_enabled else "shadow",
+            raw_text=raw_text,
+            fields=fields,
+            classification=result,
+            policy_decision=policy_decision,
+            native_action=native_action,
+            plugin_name=PLUGIN_NAME,
+            plugin_version=PLUGIN_VERSION,
+        )
+        _LOCAL_EVIDENCE_EMITTER(local_event)
+    except Exception as exc:
+        LOGGER.warning(
+            "[%s] local evidence failed open event=%s error_type=%s",
+            PLUGIN_NAME,
+            event,
+            type(exc).__name__,
+        )
+        LOGGER.debug("[%s] local evidence traceback", PLUGIN_NAME, exc_info=True)
+
+
 def _stable_request_id(
     event: str,
     metadata: Mapping[str, Any],
@@ -481,11 +552,26 @@ def pre_llm_call(
         "user_chars": _safe_len(user_message),
         "history_len": _safe_len(conversation_history or []),
     }
-    _observe(
+    observed = _observe(
         "pre_llm_call",
         fields,
         "USER_INPUT",
         user_message,
+    )
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+    )
+    _record_local_evidence(
+        event="pre_llm_call",
+        hook="user_input",
+        raw_text=user_message,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
     )
     return None
 
@@ -511,14 +597,34 @@ def pre_tool_call(
         "tool_name": tool_name or "-",
         "arg_keys": _keys(args or {}),
     }
+    classified_text = _text_for_classification(
+        {"tool_name": tool_name, "args": args or {}}
+    )
     result = _observe(
         "pre_tool_call",
         fields,
         "TOOL_CALL",
-        _text_for_classification({"tool_name": tool_name, "args": args or {}}),
+        classified_text,
         tool_name=tool_name or None,
     )
-    if _block_malicious() and _is_malicious(result):
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        result,
+        block_enabled=block_enabled,
+        block_action="block_returned",
+        pass_action="allowed",
+    )
+    _record_local_evidence(
+        event="pre_tool_call",
+        hook="pre_tool",
+        raw_text=classified_text,
+        fields=fields,
+        result=result,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
+    )
+    if policy_decision == "block":
         return _block_output(result)
     return None
 
@@ -543,7 +649,7 @@ def post_tool_call(
         "result_chars": _safe_len(result),
     }
     cache_key = _tool_result_cache_key(fields, result)
-    cached, _ = _cached_tool_result(cache_key)
+    cached, observed = _cached_tool_result(cache_key)
     if not cached:
         observed = _observe(
             "post_tool_call",
@@ -555,6 +661,21 @@ def post_tool_call(
         _store_tool_result(cache_key, observed)
     else:
         _log("post_tool_call_reused", tool_call_id=tool_call_id or "-")
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+    )
+    _record_local_evidence(
+        event="post_tool_call",
+        hook="post_tool",
+        raw_text=result,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
+    )
     return None
 
 
@@ -590,7 +711,24 @@ def transform_tool_result(
         _store_tool_result(cache_key, observed)
     else:
         _log("transform_tool_result_reused", tool_call_id=tool_call_id or "-")
-    if _block_malicious() and _is_malicious(observed):
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+        block_action="content_replaced",
+        pass_action="allowed",
+    )
+    _record_local_evidence(
+        event="transform_tool_result",
+        hook="tool_result",
+        raw_text=result,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
+    )
+    if policy_decision == "block":
         return _blocked_replacement(
             "transform_tool_result",
             fields,
@@ -622,7 +760,24 @@ def transform_llm_output(
         "LLM_OUTPUT",
         response_text,
     )
-    if _block_malicious() and _is_malicious(observed):
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+        block_action="content_replaced",
+        pass_action="allowed",
+    )
+    _record_local_evidence(
+        event="transform_llm_output",
+        hook="llm_output",
+        raw_text=response_text,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
+    )
+    if policy_decision == "block":
         return _blocked_replacement(
             "transform_llm_output",
             fields,
@@ -650,11 +805,26 @@ def subagent_start(
         "parent_turn_id": parent_turn_id or "-",
         "goal_chars": _safe_len(child_goal),
     }
-    _observe(
+    observed = _observe(
         "subagent_start",
         fields,
         "USER_INPUT",
         child_goal,
+    )
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+    )
+    _record_local_evidence(
+        event="subagent_start",
+        hook="subagent",
+        raw_text=child_goal,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
     )
     return None
 
@@ -679,11 +849,26 @@ def subagent_stop(
         "parent_turn_id": parent_turn_id or "-",
         "summary_chars": _safe_len(child_summary),
     }
-    _observe(
+    observed = _observe(
         "subagent_stop",
         fields,
         "LLM_OUTPUT",
         child_summary,
+    )
+    block_enabled = _block_malicious()
+    policy_decision, native_action = _local_evidence_decision(
+        observed,
+        block_enabled=block_enabled,
+    )
+    _record_local_evidence(
+        event="subagent_stop",
+        hook="subagent",
+        raw_text=child_summary,
+        fields=fields,
+        result=observed,
+        block_enabled=block_enabled,
+        policy_decision=policy_decision,
+        native_action=native_action,
     )
     return None
 
