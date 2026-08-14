@@ -98,6 +98,7 @@ Required environment variables:
 
 Optional environment variables:
 
+- `SILMARIL_ENDPOINT_ID` is the canonical UUID v4 supplied by the Silmaril endpoint app.
 - `HERMES_FIREWALL_SDK_TIMEOUT_SECONDS` controls the SDK request timeout. Default: `2.0`.
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
@@ -108,6 +109,8 @@ Configuration precedence is Hermes-native and environment-based: the hook reads
 the process environment used by Hermes at call time. There is no local config
 file parser, credential service, or fallback that writes secrets into plugin
 state.
+
+Every classifier request carries plugin-owned `metadata.silmaril.provenance`. If `SILMARIL_ENDPOINT_ID` is absent, the plugin continues with harness-only provenance.
 
 ## Enforcement
 

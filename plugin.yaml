@@ -1,6 +1,6 @@
 manifest_version: 1
 name: hermes-firewall
-version: 0.5.1
+version: 0.5.2
 license: Apache-2.0
 description: Fail-open Silmaril SDK firewall hooks for Hermes with readable opt-in enforcement.
 provides_hooks:
@@ -18,6 +18,8 @@ requires_env:
   - name: SILMARIL_API_URL
     description: Tenant /classify endpoint for the Silmaril Firewall API.
 optional_env:
+  - name: SILMARIL_ENDPOINT_ID
+    description: Canonical UUID v4 assigned by the endpoint application.
   - name: HERMES_FIREWALL_BLOCK_MALICIOUS
     description: Set true to block malicious content at supported pre-tool and transform boundaries.
   - name: HERMES_FIREWALL_SDK_TIMEOUT_SECONDS

@@ -28,7 +28,8 @@ Install the SDK in the Hermes Python environment:
 pip install silmaril-security-sdk==0.5.0
 ```
 
-Set `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes environment before
+Set `SILMARIL_API_KEY`, `SILMARIL_API_URL`, and the app-provided
+`SILMARIL_ENDPOINT_ID` in the Hermes environment before
 restarting Hermes.
 
 The repository includes `.env.example` with all required and optional settings.

@@ -13,6 +13,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 from collections import OrderedDict
 from typing import Any, Mapping
 
@@ -30,7 +31,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.5.1"
+PLUGIN_VERSION = "0.5.2"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -240,11 +241,7 @@ def _metadata_value(value: Any) -> Any:
 def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
     session_id = _metadata_value(fields.get("session_id"))
     child_session_id = _metadata_value(fields.get("child_session_id"))
-    return {
-        "silmaril": {
-            "integration": PLUGIN_NAME,
-            "version": PLUGIN_VERSION,
-        },
+    return _with_provenance({
         "hermesHookEvent": event,
         "conversationId": child_session_id or session_id,
         "sessionId": session_id,
@@ -257,7 +254,37 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         "childSubagentId": _metadata_value(fields.get("child_subagent_id")),
         "childRole": _metadata_value(fields.get("child_role")),
         "parentTurnId": _metadata_value(fields.get("parent_turn_id")),
+    })
+
+
+def _endpoint_id() -> str | None:
+    value = os.getenv("SILMARIL_ENDPOINT_ID", "").strip()
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        value,
+    ):
+        return value
+    return None
+
+
+def _with_provenance(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    result = dict(metadata or {})
+    existing = result.get("silmaril")
+    silmaril = dict(existing) if isinstance(existing, Mapping) else {}
+    provenance: dict[str, Any] = {
+        "schema_version": 1,
+        "harness": "hermes",
     }
+    endpoint_id = _endpoint_id()
+    if endpoint_id is not None:
+        provenance["endpoint_id"] = endpoint_id
+    silmaril.update({
+        "integration": PLUGIN_NAME,
+        "version": PLUGIN_VERSION,
+        "provenance": provenance,
+    })
+    result["silmaril"] = silmaril
+    return result
 
 
 def _classify(
@@ -278,7 +305,7 @@ def _classify(
         classify_options = {
             "hook": hook,
             "tool_name": tool_name,
-            "metadata": metadata,
+            "metadata": _with_provenance(metadata),
             "shadow_mode": True,
         }
         request_id = _stable_request_id(event, metadata or {}, text)
