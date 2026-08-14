@@ -286,10 +286,13 @@ class HermesFirewallTests(unittest.TestCase):
         })
 
         reset_state(SILMARIL_ENDPOINT_ID=endpoint_id.upper())
+        with self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs:
+            provenance = firewall._with_provenance({})["silmaril"]["provenance"]
         self.assertNotIn(
             "endpoint_id",
-            firewall._with_provenance({})["silmaril"]["provenance"],
+            provenance,
         )
+        self.assertIn("invalid SILMARIL_ENDPOINT_ID", "\n".join(logs.output))
 
     def test_empty_payloads_fail_open_without_classifier_call(self) -> None:
         reset_state(

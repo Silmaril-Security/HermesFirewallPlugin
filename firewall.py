@@ -259,11 +259,18 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
 
 def _endpoint_id() -> str | None:
     value = os.getenv("SILMARIL_ENDPOINT_ID", "").strip()
+    if not value:
+        return None
     if re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
         value,
     ):
         return value
+    LOGGER.warning(
+        "[%s] invalid SILMARIL_ENDPOINT_ID=%r; omitting endpoint provenance",
+        PLUGIN_NAME,
+        value,
+    )
     return None
 
 
