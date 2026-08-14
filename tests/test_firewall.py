@@ -21,6 +21,7 @@ import firewall
 ENV_KEYS = {
     "SILMARIL_API_KEY",
     "SILMARIL_API_URL",
+    "SILMARIL_ENDPOINT_ID",
     "HERMES_FIREWALL_BLOCK_MALICIOUS",
     "HERMES_FIREWALL_MAX_PAYLOAD_CHARS",
     "HERMES_FIREWALL_SDK_MAX_RETRIES",
@@ -241,7 +242,11 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.5.1")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.5.2")
+        self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
+            "schema_version": 1,
+            "harness": "hermes",
+        })
         self.assertRegex(
             FakeFirewall.calls[1]["options"]["request_id"],
             r"^hermes-firewall-[a-f0-9]{64}$",
@@ -255,6 +260,39 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(subagent_metadata["conversationId"], "child1")
         self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
         self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
+
+    def test_endpoint_provenance_is_canonical_and_plugin_owned(self) -> None:
+        endpoint_id = "2b64e603-f82a-4aec-9524-9736472dc80a"
+        reset_state(SILMARIL_ENDPOINT_ID=endpoint_id)
+        metadata = firewall._with_provenance({
+            "silmaril": {
+                "keep": True,
+                "provenance": {"endpoint_id": "spoofed", "harness": "spoofed"},
+            },
+            "keep": True,
+        })
+        self.assertEqual(metadata, {
+            "silmaril": {
+                "keep": True,
+                "integration": "hermes-firewall",
+                "version": "0.5.2",
+                "provenance": {
+                    "schema_version": 1,
+                    "endpoint_id": endpoint_id,
+                    "harness": "hermes",
+                },
+            },
+            "keep": True,
+        })
+
+        reset_state(SILMARIL_ENDPOINT_ID=endpoint_id.upper())
+        with self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs:
+            provenance = firewall._with_provenance({})["silmaril"]["provenance"]
+        self.assertNotIn(
+            "endpoint_id",
+            provenance,
+        )
+        self.assertIn("invalid SILMARIL_ENDPOINT_ID", "\n".join(logs.output))
 
     def test_empty_payloads_fail_open_without_classifier_call(self) -> None:
         reset_state(
