@@ -40,7 +40,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="block",
             native_action="block_returned",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.2",
+            plugin_version="0.6.0",
             occurred_at=datetime(2026, 7, 24, 12, 34, 56, tzinfo=timezone.utc),
         )
 
@@ -94,8 +94,8 @@ class LocalEvidenceTests(unittest.TestCase):
         self.assertEqual(event["provenance"], {
             "schemaVersion": 1,
             "producer": "hermes-firewall",
-            "producerVersion": "0.5.2",
-            "pluginVersion": "0.5.2",
+            "producerVersion": "0.6.0",
+            "pluginVersion": "0.6.0",
             "observedAt": "2026-07-24T12:34:56.000000Z",
         })
 
@@ -132,7 +132,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.2",
+            plugin_version="0.6.0",
         )
         serialized = json.dumps(event, sort_keys=True)
         self.assertEqual(
@@ -157,7 +157,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.2",
+            plugin_version="0.6.0",
             occurred_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
 
@@ -258,7 +258,7 @@ class LocalEvidenceTests(unittest.TestCase):
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
-            plugin_version="0.5.2",
+            plugin_version="0.6.0",
             occurred_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
 

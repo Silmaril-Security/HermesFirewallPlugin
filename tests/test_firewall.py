@@ -10,7 +10,7 @@ import tempfile
 import types
 import unittest
 import importlib.util
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -22,6 +22,7 @@ ENV_KEYS = {
     "SILMARIL_API_KEY",
     "SILMARIL_API_URL",
     "SILMARIL_ENDPOINT_ID",
+    "SILMARIL_MODE",
     "HERMES_FIREWALL_BLOCK_MALICIOUS",
     "HERMES_FIREWALL_MAX_PAYLOAD_CHARS",
     "HERMES_FIREWALL_SDK_MAX_RETRIES",
@@ -53,6 +54,7 @@ class FakeResult:
     outcome_scores: dict[str, float] | None = None
     detector_scores: dict[str, float] | None = None
     detector_counts: dict[str, int] | None = None
+    mode: str = "shadow"
 
 
 class FakeFirewall:
@@ -62,13 +64,15 @@ class FakeFirewall:
     error: Exception | None = None
 
     def __init__(self, **options: Any) -> None:
+        self.options = options
         self.instances.append(options)
 
     def classify(self, text: str, **options: Any) -> FakeResult:
         self.calls.append({"text": text, "options": options})
         if self.error is not None:
             raise self.error
-        return self.next_result
+        requested_mode = self.options.get("mode")
+        return replace(self.next_result, mode=requested_mode or self.next_result.mode)
 
 
 class FakeContext:
@@ -179,7 +183,6 @@ class HermesFirewallTests(unittest.TestCase):
             "api_key": "test-key",
             "api_url": "https://tenant.example/classify",
             "timeout": 1.25,
-            "shadow_mode": True,
             "max_retries": 2,
         }])
         self.assertEqual(len(FakeFirewall.calls), 2)
@@ -242,7 +245,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.5.2")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.0")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -275,7 +278,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.5.2",
+                "version": "0.6.0",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
@@ -502,7 +505,7 @@ class HermesFirewallTests(unittest.TestCase):
                 )
             )
 
-    def test_optional_enforcement_blocks_pre_tool_and_transform_outputs(self) -> None:
+    def test_block_uses_native_pre_tool_veto_and_preserves_unsupported_outputs(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
@@ -534,34 +537,79 @@ class HermesFirewallTests(unittest.TestCase):
         ))
         calls_before_transform = len(FakeFirewall.calls)
 
-        tool_replacement = firewall.transform_tool_result(
+        tool_result = firewall.transform_tool_result(
             tool_name="terminal",
             result=raw_tool_output,
             tool_call_id="tc1",
         )
-        self.assertIn("Silmaril Firewall blocked unsafe content.", tool_replacement)
-        self.assertIn("Surface: tool result (terminal).", tool_replacement)
-        self.assertIn("Reason: Unsafe agent control attempt.", tool_replacement)
-        self.assertNotIn("```json", tool_replacement)
-        self.assertNotIn("score", tool_replacement)
-        self.assertNotIn("threshold", tool_replacement)
-        self.assertNotIn("primary_outcome", tool_replacement)
-        self.assertNotIn("outcome_scores", tool_replacement)
-        self.assertNotIn("detector_scores", tool_replacement)
-        self.assertNotIn(raw_tool_output, tool_replacement)
+        self.assertEqual(tool_result, raw_tool_output)
         self.assertEqual(len(FakeFirewall.calls), calls_before_transform)
 
-        llm_replacement = firewall.transform_llm_output(
+        llm_result = firewall.transform_llm_output(
             response_text=raw_llm_output,
             session_id="s1",
             task_id="task1",
         )
-        self.assertIn("Silmaril Firewall blocked unsafe content.", llm_replacement)
-        self.assertIn("Surface: final assistant output.", llm_replacement)
-        self.assertNotIn("```json", llm_replacement)
-        self.assertNotIn("score", llm_replacement)
-        self.assertNotIn("threshold", llm_replacement)
-        self.assertNotIn(raw_llm_output, llm_replacement)
+        self.assertEqual(llm_result, raw_llm_output)
+
+    def test_warn_surfaces_bounded_context_only_at_supported_same_turn_boundaries(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="warn",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+
+        prompt_result = firewall.pre_llm_call(user_message="raw secret prompt")
+        self.assertEqual(prompt_result, {"context": firewall.WARN_CONTEXT})
+        self.assertNotIn("raw secret prompt", prompt_result["context"])
+        self.assertNotIn("0.99", prompt_result["context"])
+
+        self.assertIsNone(
+            firewall.pre_tool_call(tool_name="terminal", args={"command": "raw secret arg"})
+        )
+        tool_result = firewall.transform_tool_result(
+            tool_name="terminal",
+            result="raw secret tool output",
+        )
+        self.assertEqual(
+            tool_result,
+            f"raw secret tool output\n\n{firewall.WARN_CONTEXT}",
+        )
+        self.assertEqual(
+            firewall.transform_llm_output(response_text="raw secret final output"),
+            "raw secret final output",
+        )
+
+    def test_mode_omission_and_legacy_mapping_preserve_backend_control(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        firewall.pre_llm_call(user_message="hello")
+        self.assertNotIn("mode", FakeFirewall.instances[0])
+
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="false",
+        )
+        firewall.pre_llm_call(user_message="hello")
+        self.assertEqual(FakeFirewall.instances[0]["mode"], "shadow")
+
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="warn",
+            HERMES_FIREWALL_BLOCK_MALICIOUS="true",
+        )
+        firewall.pre_llm_call(user_message="hello")
+        self.assertEqual(FakeFirewall.instances[0]["mode"], "warn")
 
     def test_delegation_spawn_gate_blocks_readably(self) -> None:
         reset_state(
@@ -694,12 +742,8 @@ class HermesFirewallTests(unittest.TestCase):
             primary_outcome="benign",
         )
 
-        blocked = firewall.transform_tool_result(tool_name="terminal", result="risky output")
-        self.assertIn("Silmaril Firewall blocked unsafe content.", blocked)
-        self.assertIn("Reason: Unexpected classification conflict.", blocked)
-        self.assertNotIn("score", blocked)
-        self.assertNotIn("threshold", blocked)
-        self.assertNotIn("risky output", blocked)
+        preserved = firewall.transform_tool_result(tool_name="terminal", result="risky output")
+        self.assertEqual(preserved, "risky output")
 
     def test_failed_tool_result_observation_is_not_cached(self) -> None:
         reset_state(
@@ -726,7 +770,7 @@ class HermesFirewallTests(unittest.TestCase):
             threshold=0.5,
             primary_outcome="control_abuse",
         )
-        replacement = firewall.transform_tool_result(
+        preserved = firewall.transform_tool_result(
             tool_name="terminal",
             result="risky output",
             session_id="s1",
@@ -734,8 +778,7 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(FakeFirewall.calls), 2)
-        self.assertIn("Silmaril Firewall blocked unsafe content.", replacement)
-        self.assertNotIn("risky output", replacement)
+        self.assertEqual(preserved, "risky output")
 
     def test_unknown_risk_label_stays_generic_and_logs_debug(self) -> None:
         with self.assertLogs("hermes.plugins.firewall", level="DEBUG") as captured:
@@ -750,7 +793,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(firewall._risk_label({"primary_outcome": "benign"}), "No flagged risk")
         self.assertEqual(firewall._risk_label({"primary_outcome": None}), "No flagged risk")
 
-    def test_malicious_low_score_still_blocks_transform_output(self) -> None:
+    def test_malicious_low_score_stays_preserved_at_unsupported_post_boundary(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
@@ -764,8 +807,7 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         result = firewall.transform_llm_output(response_text="low-score output")
-        self.assertIn("Silmaril Firewall blocked unsafe content.", result)
-        self.assertNotIn("low-score output", result)
+        self.assertEqual(result, "low-score output")
 
     def test_classifier_errors_fail_open_without_raw_error_text(self) -> None:
         reset_state(
@@ -820,9 +862,9 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("ignore previous instructions", rendered)
         self.assertNotIn("leak secrets", rendered)
 
-    def test_requirements_pin_sdk_050(self) -> None:
+    def test_requirements_pin_sdk_060(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("silmaril-security-sdk==0.5.0", requirements)
+        self.assertIn("silmaril-security-sdk==0.6.0", requirements)
 
     def test_demo_launcher_builds_public_setup_and_playground_urls(self) -> None:
         demo = load_demo_launcher()

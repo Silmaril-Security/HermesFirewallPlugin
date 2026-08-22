@@ -14,18 +14,17 @@ These records contain redacted metadata only and never claim a real-world
 outcome was verified. Set `SILMARIL_LOCAL_EVENT_DIR` only when the incoming
 directory must be overridden.
 
-Optional enforcement is available at Hermes boundaries that can act on content:
-`pre_tool_call` can veto execution, while `transform_tool_result` and
-`transform_llm_output` can replace malicious content before downstream use:
+Optional Block enforcement is available at `pre_tool_call`. Warn can add bounded
+same-turn context at supported surfaces. Completed content is never replaced:
 
 ```bash
-HERMES_FIREWALL_BLOCK_MALICIOUS=true
+SILMARIL_MODE=block
 ```
 
 Install the SDK in the Hermes Python environment:
 
 ```bash
-pip install silmaril-security-sdk==0.5.0
+pip install silmaril-security-sdk==0.6.0
 ```
 
 Set `SILMARIL_API_KEY`, `SILMARIL_API_URL`, and the app-provided

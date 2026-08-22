@@ -1,9 +1,10 @@
 # Hermes Firewall
 
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
-with the Silmaril Security SDK. It defaults to shadow/pass-through mode without
-injecting context, and can optionally block malicious pre-tool calls plus
-replace malicious tool or final LLM output at Hermes transform boundaries.
+with the Silmaril Security SDK. Shadow is silent, Warn adds one bounded warning
+to supported same-turn context, and Block vetoes malicious pre-tool calls.
+Completed tool or LLM output is never replaced; unsupported Block boundaries
+remain unchanged and record `block_unavailable`.
 
 ## Install
 
@@ -18,7 +19,7 @@ The plugin requires the Silmaril Security SDK in the same Python environment
 that runs Hermes:
 
 ```bash
-pip install silmaril-security-sdk==0.5.0
+pip install silmaril-security-sdk==0.6.0
 ```
 
 Copy `.env.example` into your Hermes environment manager or shell profile and
@@ -46,15 +47,15 @@ hermes gateway restart
 The plugin registers seven hooks:
 
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
-- `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when `HERMES_FIREWALL_BLOCK_MALICIOUS=true` and the classifier returns a malicious result.
+- `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the classifier returns a malicious result.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
-- `transform_tool_result` reuses the matching `post_tool_call` classification, then returns the original result by default or a safe replacement when blocking is enabled and the result is malicious.
-- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT`, then returns the original response by default or a safe replacement when blocking is enabled and the output is malicious.
+- `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block preserves the completed result and records `block_unavailable`.
+- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and never replaces completed output.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
-The SDK client is created with `shadow_mode=True`, so classification output is
-logged without relying on SDK exceptions for control flow. SDK import,
+The SDK client omits mode unless a pilot override is configured, so the backend
+selects the effective mode by default. SDK import,
 configuration, network, API, malformed payload, empty payload, and classification
 failures are logged and fail open.
 
@@ -79,7 +80,7 @@ metadata, opaque request/session fingerprints, decision facts, native action,
 and plugin provenance. It never contains raw prompts, arguments, results,
 assistant output, credentials, detector maps, or error bodies. Events always
 report `outcome=not_observed`. Allowed and monitored actions report
-`evidenceTruth=plugin_reported`; returned Hermes blocks and replacements report
+`evidenceTruth=plugin_reported`; returned Hermes native vetoes report
 `evidenceTruth=native_response_returned`. Neither value claims the downstream
 consequence was independently prevented.
 
@@ -102,7 +103,8 @@ Optional environment variables:
 - `HERMES_FIREWALL_SDK_TIMEOUT_SECONDS` controls the SDK request timeout. Default: `2.0`.
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
-- `HERMES_FIREWALL_BLOCK_MALICIOUS` enables optional blocking at supported pre-tool and transform boundaries. Default: `false`.
+- `SILMARIL_MODE` optionally overrides the backend with `shadow`, `warn`, or `block`.
+- `HERMES_FIREWALL_BLOCK_MALICIOUS` is the deprecated legacy mapping; true maps to Block and false maps to Shadow.
 - `SILMARIL_LOCAL_EVENT_DIR` directly overrides the incoming evidence directory. It is primarily intended for testing and nonstandard installations.
 
 Configuration precedence is Hermes-native and environment-based: the hook reads
@@ -114,8 +116,8 @@ Every classifier request carries plugin-owned `metadata.silmaril.provenance`. If
 
 ## Enforcement
 
-Hermes supports pre-execution vetoes through `pre_tool_call` and post-execution
-replacement through `transform_tool_result` and `transform_llm_output`.
+Hermes supports pre-execution vetoes through `pre_tool_call`. Transform hooks
+can deliver Warn context but never replace completed content in Block mode.
 `post_tool_call`, `subagent_start`, and `subagent_stop` remain observe-only
 because those Hermes hooks have no enforcement return channel. Unsafe delegation
 is blocked at the nearest enforceable gate: the `delegate_task` tool call
@@ -124,16 +126,12 @@ is blocked at the nearest enforceable gate: the `delegate_task` tool call
 agent prompts, tool calls, tool results, and final outputs are scanned through
 the same normal hook path used for parent sessions.
 
-Default behavior is pass-through:
-
-```bash
-HERMES_FIREWALL_BLOCK_MALICIOUS=false
-```
+By default, neither mode variable is set and the backend selects the effective mode.
 
 To enable enforcement at supported boundaries:
 
 ```bash
-HERMES_FIREWALL_BLOCK_MALICIOUS=true
+SILMARIL_MODE=block
 ```
 
 When enabled, malicious `pre_tool_call` classifications return the Hermes veto
@@ -143,10 +141,9 @@ shape with readable copy:
 Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.
 ```
 
-Malicious transform-hook classifications return a safe replacement string with
-surface, reason, action, and next step. The replacement does not include raw
-classifier JSON, scores, thresholds, detector maps, original tool output, or
-assistant text.
+Malicious Block decisions at transform hooks preserve the original content and
+record `block_unavailable`. Warn output is fixed and never includes raw content,
+arguments, results, secrets, scores, thresholds, detector maps, or hidden policy.
 
 ## Public Demo
 
