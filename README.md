@@ -58,6 +58,9 @@ The SDK client omits mode unless a pilot override is configured, so the backend
 selects the effective mode by default. SDK import,
 configuration, network, API, malformed payload, empty payload, and classification
 failures are logged and fail open.
+During a rolling backend upgrade, an explicit override remains authoritative
+and a mode-less legacy response preserves the plugin's observe-only default
+instead of escalating to Block.
 
 Only the exact prediction `MALICIOUS` is enforceable. Scores, thresholds,
 outcomes, missing predictions, and unknown predictions remain diagnostic. A

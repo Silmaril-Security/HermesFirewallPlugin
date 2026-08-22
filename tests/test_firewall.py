@@ -54,7 +54,13 @@ class FakeResult:
     outcome_scores: dict[str, float] | None = None
     detector_scores: dict[str, float] | None = None
     detector_counts: dict[str, int] | None = None
-    mode: str = "shadow"
+    mode: str | None = "shadow"
+
+
+class FakeFirewallBlockedException(Exception):
+    def __init__(self, result: FakeResult | None) -> None:
+        self.result = result
+        super().__init__("blocked")
 
 
 class FakeFirewall:
@@ -72,7 +78,11 @@ class FakeFirewall:
         if self.error is not None:
             raise self.error
         requested_mode = self.options.get("mode")
-        return replace(self.next_result, mode=requested_mode or self.next_result.mode)
+        result = replace(self.next_result, mode=requested_mode or self.next_result.mode)
+        effective_mode = requested_mode or result.mode or "block"
+        if result.prediction == "MALICIOUS" and effective_mode == "block":
+            raise FakeFirewallBlockedException(result)
+        return result
 
 
 class FakeContext:
@@ -87,6 +97,7 @@ def install_fake_sdk() -> None:
     package = types.ModuleType("silmaril_security")
     sdk = types.ModuleType("silmaril_security.sdk")
     sdk.Firewall = FakeFirewall
+    sdk.FirewallBlockedException = FakeFirewallBlockedException
     sdk.HookLabel = FakeHookLabel
     sys.modules["silmaril_security"] = package
     sys.modules["silmaril_security.sdk"] = sdk
@@ -318,9 +329,22 @@ class HermesFirewallTests(unittest.TestCase):
             score=0.99,
             threshold=0.5,
             primary_outcome="control_abuse",
+            mode=None,
         )
 
         self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"}))
+
+    def test_explicit_shadow_cannot_be_escalated_by_backend_block_mode(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="shadow",
+        )
+
+        self.assertEqual(
+            firewall._effective_mode({"prediction": "MALICIOUS", "mode": "block"}),
+            "shadow",
+        )
 
     def test_shadow_mode_preserves_every_supported_boundary(self) -> None:
         reset_state(

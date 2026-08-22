@@ -182,14 +182,14 @@ def _configured_mode() -> str | None:
     return "block" if _bool_env("HERMES_FIREWALL_BLOCK_MALICIOUS", False) else "shadow"
 
 
-def _sdk_symbols() -> tuple[Any, Any]:
+def _sdk_symbols() -> tuple[Any, Any, Any]:
     try:
-        from silmaril_security.sdk import Firewall, HookLabel
+        from silmaril_security.sdk import Firewall, FirewallBlockedException, HookLabel
     except Exception as exc:
         raise RuntimeError(
             "silmaril-security-sdk is not installed or could not be imported"
         ) from exc
-    return Firewall, HookLabel
+    return Firewall, HookLabel, FirewallBlockedException
 
 
 def _firewall_client() -> Any:
@@ -209,7 +209,7 @@ def _firewall_client() -> Any:
     if _SDK_CLIENT is not None and _SDK_CONFIG == config:
         return _SDK_CLIENT
 
-    Firewall, _ = _sdk_symbols()
+    Firewall, _, _ = _sdk_symbols()
     client_options = dict(
         api_key=api_key,
         api_url=api_url,
@@ -325,7 +325,7 @@ def _classify(
 
     try:
         client = _firewall_client()
-        _, HookLabel = _sdk_symbols()
+        _, HookLabel, FirewallBlockedException = _sdk_symbols()
         hook = getattr(HookLabel, hook_name)
         classify_options = {
             "hook": hook,
@@ -335,10 +335,18 @@ def _classify(
         request_id = _stable_request_id(event, metadata or {}, text)
         if request_id is not None:
             classify_options["request_id"] = request_id
-        result = client.classify(
-            text,
-            **classify_options,
-        )
+        try:
+            result = client.classify(
+                text,
+                **classify_options,
+            )
+        except FirewallBlockedException as exc:
+            # The SDK expresses effective Block as an exception. Recover its
+            # typed result so this plugin can invoke the host's genuine native
+            # veto instead of treating a policy decision as an outage.
+            if exc.result is None:
+                raise
+            result = exc.result
         result_dict = _result_dict(result)
         LOGGER.info(
             "[%s] sdk_result event=%s hook=%s tool_name=%s tool_call_id=%s prediction=%s risk=%s blocked=%s",
@@ -387,10 +395,15 @@ def _is_malicious(result: Mapping[str, Any] | None) -> bool:
 
 
 def _effective_mode(result: Mapping[str, Any] | None) -> str:
+    configured = _configured_mode()
+    if configured is not None:
+        # A configured mode is the per-request override. Keep it authoritative
+        # across legacy or mixed-version backend responses.
+        return configured
     returned = result.get("mode") if result is not None else None
     if returned in {"shadow", "warn", "block"}:
         return str(returned)
-    return _configured_mode() or "shadow"
+    return "shadow"
 
 
 def _local_evidence_decision(
