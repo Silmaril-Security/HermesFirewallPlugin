@@ -69,10 +69,10 @@ def build_local_protection_event(
     classification: Mapping[str, Any] | None,
     policy_decision: str,
     native_action: str,
-    warn_delivery: str | None = None,
-    block_unavailable: bool = False,
     plugin_name: str,
     plugin_version: str,
+    warn_delivery: str | None = None,
+    block_unavailable: bool = False,
     occurred_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the frozen LocalProtectionEventV1 JSON shape."""
