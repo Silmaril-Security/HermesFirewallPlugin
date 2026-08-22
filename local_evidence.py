@@ -71,6 +71,8 @@ def build_local_protection_event(
     native_action: str,
     plugin_name: str,
     plugin_version: str,
+    warn_delivery: str | None = None,
+    block_unavailable: bool = False,
     occurred_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the frozen LocalProtectionEventV1 JSON shape."""
@@ -114,7 +116,7 @@ def build_local_protection_event(
         "outcome": "not_observed",
         "evidenceTruth": (
             "native_response_returned"
-            if native_action in {"block_returned", "content_replaced"}
+            if native_action == "block_returned"
             else "plugin_reported"
         ),
         "evidenceCompleteness": "partial",
@@ -137,6 +139,8 @@ def build_local_protection_event(
         "riskClass": consequence["category"],
         "modelScore": _unit_interval(result.get("score")),
         "modelThreshold": _unit_interval(result.get("threshold")),
+        "warnDelivery": warn_delivery,
+        "blockUnavailable": True if block_unavailable else None,
     }
     local_event.update(
         {
