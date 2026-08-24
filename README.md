@@ -54,6 +54,10 @@ The plugin registers seven hooks:
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
+Each native Hermes event produces at most one classification. `pre_llm_call`
+accepts the host's `conversation_history` argument for compatibility but ignores
+it; conversation state is owned by the Firewall sequence cache.
+
 The SDK client omits mode unless a pilot override is configured, so the backend
 selects the effective mode by default. SDK import,
 configuration, network, API, malformed payload, empty payload, and classification
