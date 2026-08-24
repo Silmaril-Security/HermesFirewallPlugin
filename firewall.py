@@ -30,7 +30,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.1"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -591,14 +591,15 @@ def pre_llm_call(
     platform: str = "",
     **kwargs: Any,
 ) -> dict[str, str] | None:
-    """Observe a user turn and return bounded Warn context when supported."""
+    """Observe the current user turn; sequence state belongs to Firewall."""
+    # Hermes supplies conversation_history for host compatibility. Never inspect
+    # or classify it: earlier events already populate the Firewall sequence cache.
     fields = {
         "session_id": session_id or "-",
         "platform": platform or "-",
         "model": model or "-",
         "first_turn": is_first_turn,
         "user_chars": _safe_len(user_message),
-        "history_len": _safe_len(conversation_history or []),
     }
     observed = _observe(
         "pre_llm_call",

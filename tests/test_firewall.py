@@ -256,7 +256,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.0")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.1")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -275,6 +275,30 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
         self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
 
+    def test_pre_llm_call_ignores_conversation_history(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        history = [
+            {"role": "user", "content": f"historical prompt {index}"}
+            for index in range(300)
+        ]
+
+        self.assertIsNone(
+            firewall.pre_llm_call(
+                user_message="current prompt",
+                conversation_history=history,
+                session_id="s1",
+            )
+        )
+
+        self.assertEqual(len(FakeFirewall.calls), 1)
+        self.assertEqual(FakeFirewall.calls[0]["text"], "current prompt")
+        metadata = FakeFirewall.calls[0]["options"]["metadata"]
+        self.assertNotIn("history_len", metadata)
+        self.assertNotIn("conversation_history", metadata)
+
     def test_endpoint_provenance_is_canonical_and_plugin_owned(self) -> None:
         endpoint_id = "2b64e603-f82a-4aec-9524-9736472dc80a"
         reset_state(SILMARIL_ENDPOINT_ID=endpoint_id)
@@ -289,7 +313,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.0",
+                "version": "0.6.1",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
