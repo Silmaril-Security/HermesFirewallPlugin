@@ -4,7 +4,7 @@ A fail-open Hermes directory plugin that classifies firewall lifecycle events
 with the Silmaril Security SDK. Shadow is silent, Warn adds one bounded warning
 to supported same-turn context, and Block vetoes malicious pre-tool calls.
 Completed tool or LLM output is never replaced; unsupported Block boundaries
-remain unchanged and record `block_unavailable`.
+are replaced with fixed, content-free output at Hermes transform hooks.
 
 ## Install
 
@@ -49,8 +49,8 @@ The plugin registers seven hooks:
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the classifier returns a malicious result.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
-- `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block preserves the completed result and records `block_unavailable`.
-- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and never replaces completed output.
+- `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block replaces the result before model reuse.
+- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and replaces malicious Block output before delivery.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
@@ -148,8 +148,8 @@ shape with readable copy:
 Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.
 ```
 
-Malicious Block decisions at transform hooks preserve the original content and
-record `block_unavailable`. Warn output is fixed and never includes raw content,
+Malicious Block decisions at transform hooks replace the original content with
+fixed, content-free text. Warn output is fixed and never includes raw content,
 arguments, results, secrets, scores, thresholds, detector maps, or hidden policy.
 
 ## Public Demo

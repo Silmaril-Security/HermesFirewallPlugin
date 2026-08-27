@@ -30,7 +30,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.1"
+PLUGIN_VERSION = "0.6.2"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -741,7 +741,7 @@ def transform_tool_result(
     duration_ms: int | None = None,
     **kwargs: Any,
 ) -> str:
-    """Observe a transform hook; Warn appends context and Block never replaces."""
+    """Classify a tool result and replace malicious Block content before reuse."""
     fields = {
         "session_id": session_id or "-",
         "task_id": task_id or "-",
@@ -765,6 +765,7 @@ def transform_tool_result(
         _log("transform_tool_result_reused", tool_call_id=tool_call_id or "-")
     mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
         observed,
+        block_action="content_replaced",
         warn_action="warning_context_returned",
         pass_action="allowed",
     )
@@ -782,6 +783,8 @@ def transform_tool_result(
     )
     if policy_decision == "warn":
         return f"{result}\n\n{WARN_CONTEXT}"
+    if policy_decision == "block" and observed is not None:
+        return _block_message(observed, "tool result")
     return result
 
 
@@ -793,7 +796,7 @@ def transform_llm_output(
     platform: str = "",
     **kwargs: Any,
 ) -> str:
-    """Observe final assistant output without replacing content."""
+    """Classify and replace malicious final output at the Hermes transform hook."""
     fields = {
         "session_id": session_id or "-",
         "task_id": task_id or "-",
@@ -809,6 +812,7 @@ def transform_llm_output(
     )
     mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
         observed,
+        block_action="content_replaced",
         pass_action="allowed",
     )
     _record_local_evidence(
@@ -823,6 +827,8 @@ def transform_llm_output(
         warn_delivery=warn_delivery,
         block_unavailable=block_unavailable,
     )
+    if policy_decision == "block" and observed is not None:
+        return _block_message(observed, "assistant output")
     return response_text
 
 
