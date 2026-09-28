@@ -259,7 +259,9 @@ def _metadata_value(value: Any) -> Any:
 def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
     session_id = _metadata_value(fields.get("session_id"))
     child_session_id = _metadata_value(fields.get("child_session_id"))
-    return _with_provenance({
+    model = fields.get("model")
+    model_id = model.strip() if isinstance(model, str) else ""
+    metadata = {
         "hermesHookEvent": event,
         "conversationId": child_session_id or session_id,
         "sessionId": session_id,
@@ -272,7 +274,10 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         "childSubagentId": _metadata_value(fields.get("child_subagent_id")),
         "childRole": _metadata_value(fields.get("child_role")),
         "parentTurnId": _metadata_value(fields.get("parent_turn_id")),
-    })
+    }
+    if model_id and model_id != "-":
+        metadata["silmaril"] = {"agent_model_id": model_id}
+    return _with_provenance(metadata)
 
 
 def _endpoint_id() -> str | None:
