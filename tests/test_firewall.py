@@ -261,7 +261,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.2")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.3")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -318,7 +318,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.2",
+                "version": "0.6.3",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
