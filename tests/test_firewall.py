@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import logging
 import os
 import shutil
 import sys
@@ -132,7 +133,11 @@ def load_demo_launcher() -> Any:
 
 
 class HermesFirewallTests(unittest.TestCase):
+    def setUp(self) -> None:
+        firewall._reset_mac_device_name_lookup_for_tests(platform="linux")
+
     def tearDown(self) -> None:
+        firewall._reset_mac_device_name_lookup_for_tests(platform="linux")
         for key in ENV_KEYS:
             os.environ.pop(key, None)
         firewall._SDK_CLIENT = None
@@ -331,6 +336,185 @@ class HermesFirewallTests(unittest.TestCase):
             provenance,
         )
         self.assertIn("invalid SILMARIL_ENDPOINT_ID", "\n".join(logs.output))
+
+    def test_mac_computer_name_is_plugin_owned_classify_provenance(self) -> None:
+        endpoint_id = "2b64e603-f82a-4aec-9524-9736472dc80a"
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_ENDPOINT_ID=endpoint_id,
+        )
+        clock = {"now": 0.0}
+        calls: list[tuple[Any, ...]] = []
+
+        def command(args: tuple[str, ...], *, timeout: float, max_output_bytes: int) -> bytes:
+            calls.append((args, timeout, max_output_bytes))
+            return b"  Office Mac \n"
+
+        firewall._reset_mac_device_name_lookup_for_tests(
+            platform="darwin",
+            now=lambda: clock["now"],
+            command=command,
+        )
+        self.assertIsNone(firewall.pre_llm_call(user_message="hello"))
+        provenance = FakeFirewall.calls[0]["options"]["metadata"]["silmaril"]["provenance"]
+        self.assertEqual(provenance, {
+            "schema_version": 1,
+            "harness": "hermes",
+            "endpoint_id": endpoint_id,
+            "device_name": "Office Mac",
+        })
+        self.assertEqual(calls, [(
+            ("/usr/sbin/scutil", "--get", "ComputerName"),
+            0.1,
+            1024,
+        )])
+        evidence = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in Path(os.environ["SILMARIL_LOCAL_EVENT_DIR"]).glob("*.json")
+        )
+        self.assertNotIn("Office Mac", evidence)
+        self.assertNotIn("device_name", evidence)
+
+        clock["now"] = 299.0
+        firewall.pre_llm_call(user_message="again")
+        self.assertEqual(len(calls), 1)
+        clock["now"] = 300.0
+        firewall.pre_llm_call(user_message="refresh")
+        self.assertEqual(len(calls), 2)
+
+    def test_default_scutil_command_supplies_the_computer_name(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        firewall._reset_mac_device_name_lookup_for_tests(platform="darwin")
+        completed = mock.Mock(returncode=0, stdout=b"Office Mac\n")
+        with mock.patch("firewall.subprocess.run", return_value=completed) as run:
+            self.assertIsNone(firewall.pre_llm_call(user_message="hello"))
+            args, kwargs = run.call_args
+            self.assertEqual(list(args[0]), ["/usr/sbin/scutil", "--get", "ComputerName"])
+            self.assertEqual(kwargs["timeout"], 0.1)
+            self.assertTrue(kwargs["capture_output"])
+            self.assertFalse(kwargs["check"])
+            self.assertIs(kwargs["stdin"], __import__("subprocess").DEVNULL)
+            self.assertFalse(kwargs.get("shell", False))
+        provenance = FakeFirewall.calls[0]["options"]["metadata"]["silmaril"]["provenance"]
+        self.assertEqual(provenance["device_name"], "Office Mac")
+        self.assertNotIn("endpoint_id", provenance)
+        self.assertEqual(provenance["harness"], "hermes")
+
+    def test_invalid_mac_computer_names_are_omitted(self) -> None:
+        rejected: list[bytes | str] = [
+            b"",
+            b" \n\t",
+            b"\xff",
+            "a" * 257,
+            "😀" * 129,
+            "bad\u0000name",
+            "bad\u001fname",
+            "bad\u007fname",
+            f"{' ' * 1022}Mac",
+        ]
+        for output in rejected:
+            firewall._reset_mac_device_name_lookup_for_tests(
+                platform="darwin",
+                command=lambda *_args, _output=output, **_kwargs: _output,
+            )
+            provenance = firewall._with_provenance({})["silmaril"]["provenance"]
+            self.assertNotIn("device_name", provenance, output)
+            self.assertEqual(provenance["harness"], "hermes")
+        for output in ("a" * 256, "😀" * 128, f"{' ' * 1021}Mac"):
+            firewall._reset_mac_device_name_lookup_for_tests(
+                platform="darwin",
+                command=lambda *_args, _output=output, **_kwargs: _output,
+            )
+            provenance = firewall._with_provenance({})["silmaril"]["provenance"]
+            self.assertEqual(provenance["device_name"], output.strip())
+            self.assertLessEqual(firewall._utf16_code_units(provenance["device_name"]), 256)
+
+    def test_spoofed_device_name_metadata_cannot_win(self) -> None:
+        firewall._reset_mac_device_name_lookup_for_tests(
+            platform="darwin",
+            command=lambda *_args, **_kwargs: b"Office Mac\n",
+        )
+        metadata = firewall._with_provenance({
+            "silmaril": {
+                "keep": True,
+                "provenance": {"device_name": "spoofed", "harness": "spoofed", "endpoint_id": "spoofed"},
+            },
+            "keep": True,
+        })
+        self.assertEqual(metadata["silmaril"]["provenance"]["device_name"], "Office Mac")
+        self.assertEqual(metadata["silmaril"]["provenance"]["harness"], "hermes")
+        self.assertNotIn("endpoint_id", metadata["silmaril"]["provenance"])
+        self.assertTrue(metadata["silmaril"]["keep"])
+
+        def fail_lookup(*_args: Any, **_kwargs: Any) -> str:
+            raise RuntimeError("SECRET-COMPUTER")
+
+        firewall._reset_mac_device_name_lookup_for_tests(
+            platform="darwin",
+            command=fail_lookup,
+        )
+        provenance = firewall._with_provenance({
+            "silmaril": {"provenance": {"device_name": "spoofed"}},
+        })["silmaril"]["provenance"]
+        self.assertNotIn("device_name", provenance)
+
+    def test_non_darwin_does_not_read_a_mac_computer_name(self) -> None:
+        source = Path("firewall.py").read_text(encoding="utf-8")
+        self.assertNotIn("hostname", source)
+        self.assertNotIn("LocalHostName", source)
+        calls = {"count": 0}
+
+        def command(*_args: Any, **_kwargs: Any) -> str:
+            calls["count"] += 1
+            return "Office Mac"
+
+        for platform in ("linux", "win32"):
+            calls["count"] = 0
+            firewall._reset_mac_device_name_lookup_for_tests(platform=platform, command=command)
+            provenance = firewall._with_provenance({
+                "silmaril": {"provenance": {"device_name": "spoofed"}},
+            })["silmaril"]["provenance"]
+            self.assertEqual(calls["count"], 0)
+            self.assertNotIn("device_name", provenance)
+            self.assertEqual(provenance["harness"], "hermes")
+
+    def test_computer_name_lookup_failure_still_classifies(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        calls = {"count": 0}
+
+        def command(*_args: Any, **_kwargs: Any) -> str:
+            calls["count"] += 1
+            raise RuntimeError("SECRET-COMPUTER")
+
+        firewall._reset_mac_device_name_lookup_for_tests(platform="darwin", command=command)
+        logger = logging.getLogger("hermes.plugins.firewall")
+        previous_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger.addHandler(handler)
+        try:
+            self.assertIsNone(firewall.pre_llm_call(user_message="hello"))
+            firewall.pre_llm_call(user_message="again")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+        self.assertEqual(len(FakeFirewall.calls), 2)
+        self.assertNotIn("device_name", FakeFirewall.calls[0]["options"]["metadata"]["silmaril"]["provenance"])
+        self.assertEqual(calls["count"], 1)
+        self.assertNotIn("SECRET-COMPUTER", stream.getvalue())
+        evidence = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in Path(os.environ["SILMARIL_LOCAL_EVENT_DIR"]).glob("*.json")
+        )
+        self.assertNotIn("SECRET-COMPUTER", evidence)
 
     def test_empty_payloads_fail_open_without_classifier_call(self) -> None:
         reset_state(

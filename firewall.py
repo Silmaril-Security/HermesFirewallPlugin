@@ -13,7 +13,11 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
+import sys
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any, Mapping
 
 try:
@@ -45,6 +49,15 @@ _SDK_CONFIG: tuple[str, str, float, int, str | None] | None = None
 _TOOL_RESULT_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
 _MAX_TOOL_RESULT_CACHE_ENTRIES = 256
 _LOCAL_EVIDENCE_EMITTER = write_local_protection_event
+_MAC_DEVICE_NAME_TIMEOUT_SECONDS = 0.1
+_MAC_DEVICE_NAME_MAX_OUTPUT_BYTES = 1024
+_MAC_DEVICE_NAME_MAX_UTF16_UNITS = 256
+_MAC_DEVICE_NAME_CACHE_TTL_SECONDS = 300.0
+_MAC_DEVICE_NAME_ARGV = ("/usr/sbin/scutil", "--get", "ComputerName")
+_device_name_platform = sys.platform
+_device_name_now: Callable[[], float] = time.monotonic
+_device_name_command: Callable[..., bytes | str | None] | None = None
+_device_name_cache: tuple[float, str | None] | None = None
 
 
 def _safe_len(value: Any) -> int:
@@ -275,6 +288,96 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
     })
 
 
+def _default_mac_device_name_command(
+    args: tuple[str, ...] | list[str],
+    *,
+    timeout: float,
+    max_output_bytes: int,
+) -> bytes:
+    try:
+        completed = subprocess.run(
+            list(args),
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise OSError("mac device name lookup failed") from None
+    if completed.returncode != 0 or len(completed.stdout) > max_output_bytes:
+        raise OSError("mac device name lookup failed")
+    return completed.stdout
+
+
+def _utf16_code_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _normalize_mac_device_name(raw: bytes | str, *, max_output_bytes: int) -> str | None:
+    if isinstance(raw, bytes):
+        if len(raw) > max_output_bytes:
+            return None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(raw, str):
+        try:
+            encoded_size = len(raw.encode("utf-8"))
+        except UnicodeEncodeError:
+            return None
+        if encoded_size > max_output_bytes:
+            return None
+        text = raw
+    else:
+        return None
+    name = text.strip()
+    if not name or _utf16_code_units(name) > _MAC_DEVICE_NAME_MAX_UTF16_UNITS:
+        return None
+    if any(ord(char) <= 0x1F or ord(char) == 0x7F for char in name):
+        return None
+    return name
+
+
+def _reset_mac_device_name_lookup_for_tests(
+    *,
+    platform: str | None = None,
+    now: Callable[[], float] | None = None,
+    command: Callable[..., bytes | str | None] | None = None,
+) -> None:
+    global _device_name_platform, _device_name_now, _device_name_command, _device_name_cache
+    _device_name_platform = sys.platform if platform is None else platform
+    _device_name_now = time.monotonic if now is None else now
+    _device_name_command = command
+    _device_name_cache = None
+
+
+def _mac_device_name() -> str | None:
+    global _device_name_cache
+    if _device_name_platform != "darwin":
+        return None
+    now = _device_name_now()
+    if _device_name_cache is not None and now < _device_name_cache[0]:
+        return _device_name_cache[1]
+    value: str | None = None
+    try:
+        command = _device_name_command or _default_mac_device_name_command
+        raw = command(
+            _MAC_DEVICE_NAME_ARGV,
+            timeout=_MAC_DEVICE_NAME_TIMEOUT_SECONDS,
+            max_output_bytes=_MAC_DEVICE_NAME_MAX_OUTPUT_BYTES,
+        )
+        if raw is not None:
+            value = _normalize_mac_device_name(
+                raw,
+                max_output_bytes=_MAC_DEVICE_NAME_MAX_OUTPUT_BYTES,
+            )
+    except Exception:
+        value = None
+    _device_name_cache = (now + _MAC_DEVICE_NAME_CACHE_TTL_SECONDS, value)
+    return value
+
+
 def _endpoint_id() -> str | None:
     value = os.getenv("SILMARIL_ENDPOINT_ID", "").strip()
     if not value:
@@ -303,6 +406,9 @@ def _with_provenance(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     endpoint_id = _endpoint_id()
     if endpoint_id is not None:
         provenance["endpoint_id"] = endpoint_id
+    device_name = _mac_device_name()
+    if device_name is not None:
+        provenance["device_name"] = device_name
     silmaril.update({
         "integration": PLUGIN_NAME,
         "version": PLUGIN_VERSION,
