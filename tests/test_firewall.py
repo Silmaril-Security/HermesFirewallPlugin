@@ -414,6 +414,9 @@ class HermesFirewallTests(unittest.TestCase):
             "bad\u0000name",
             "bad\u001fname",
             "bad\u007fname",
+            "Mac\u0080Book",
+            "Mac\u0085Book",
+            "Mac\u009fBook",
             f"{' ' * 1022}Mac",
         ]
         for output in rejected:
@@ -424,7 +427,7 @@ class HermesFirewallTests(unittest.TestCase):
             provenance = firewall._with_provenance({})["silmaril"]["provenance"]
             self.assertNotIn("device_name", provenance, output)
             self.assertEqual(provenance["harness"], "hermes")
-        for output in ("a" * 256, "😀" * 128, f"{' ' * 1021}Mac"):
+        for output in ("a" * 256, "😀" * 128, "Café Mac", f"{' ' * 1021}Mac"):
             firewall._reset_mac_device_name_lookup_for_tests(
                 platform="darwin",
                 command=lambda *_args, _output=output, **_kwargs: _output,

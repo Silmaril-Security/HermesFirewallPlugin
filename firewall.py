@@ -334,7 +334,7 @@ def _normalize_mac_device_name(raw: bytes | str, *, max_output_bytes: int) -> st
     name = text.strip()
     if not name or _utf16_code_units(name) > _MAC_DEVICE_NAME_MAX_UTF16_UNITS:
         return None
-    if any(ord(char) <= 0x1F or ord(char) == 0x7F for char in name):
+    if any(ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F for char in name):
         return None
     return name
 
