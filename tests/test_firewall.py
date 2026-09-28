@@ -197,6 +197,13 @@ class HermesFirewallTests(unittest.TestCase):
             "max_retries": 2,
         }])
         self.assertEqual(len(FakeFirewall.calls), 2)
+        self.assertEqual(
+            FakeFirewall.calls[0]["options"]["metadata"]["silmaril"]["agent_model_id"],
+            "claude",
+        )
+        self.assertNotIn(
+            "agent_model_id", FakeFirewall.calls[1]["options"]["metadata"]["silmaril"]
+        )
 
     def test_hook_mapping_and_metadata(self) -> None:
         reset_state(
@@ -274,6 +281,21 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(subagent_metadata["conversationId"], "child1")
         self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
         self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
+
+    def test_model_id_follows_each_host_reported_llm_event(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+        firewall.pre_llm_call(user_message="first", session_id="s1", model="model-a")
+        firewall.pre_llm_call(user_message="second", session_id="s1", model="model-b")
+        firewall.transform_llm_output(response_text="answer", session_id="s1", model="model-b")
+        firewall.pre_llm_call(user_message="third", session_id="s1")
+        model_ids = [
+            call["options"]["metadata"]["silmaril"].get("agent_model_id")
+            for call in FakeFirewall.calls
+        ]
+        self.assertEqual(model_ids, ["model-a", "model-b", "model-b", None])
 
     def test_pre_llm_call_ignores_conversation_history(self) -> None:
         reset_state(
