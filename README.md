@@ -1,10 +1,11 @@
 # Hermes Firewall
 
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
-with the Silmaril Security SDK. Shadow is silent, Warn adds one bounded warning
-to supported same-turn context, and Block vetoes malicious pre-tool calls.
-Completed tool or LLM output is never replaced; unsupported Block boundaries
-are replaced with fixed, content-free output at Hermes transform hooks.
+with the Silmaril Security SDK. Shadow is silent. Warn adds one bounded warning
+on supported same-turn surfaces. Block vetoes malicious `pre_tool_call` events.
+`post_tool_call` is observe-only. `transform_tool_result` and
+`transform_llm_output` replace malicious Block output with fixed, content-free
+text. Hooks without an enforcement return leave completed content unchanged.
 
 ## Install
 
@@ -15,8 +16,9 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-The plugin requires the Silmaril Security SDK in the same Python environment
-that runs Hermes:
+This plugin's manifest version is 0.6.3 (`plugin.yaml` and `PLUGIN_VERSION`
+in `firewall.py`). It requires Silmaril Security SDK 0.6.0, the version pinned
+in `requirements.txt`, in the same Python environment that runs Hermes:
 
 ```bash
 pip install silmaril-security-sdk==0.6.0
@@ -58,21 +60,32 @@ Each native Hermes event produces at most one classification. `pre_llm_call`
 accepts the host's `conversation_history` argument for compatibility but ignores
 it; conversation state is owned by the Firewall sequence cache.
 
-The SDK client omits mode unless a pilot override is configured, so the backend
-selects the effective mode by default. SDK import,
-configuration, network, API, malformed payload, empty payload, and classification
-failures are logged and fail open.
-During a rolling backend upgrade, an explicit override remains authoritative
-and a mode-less legacy response preserves the plugin's observe-only default
-instead of escalating to Block.
+Effective mode is chosen in this order: a valid `SILMARIL_MODE` of `shadow`,
+`warn`, or `block`; otherwise `HERMES_FIREWALL_BLOCK_MALICIOUS` (`true` is
+Block and `false` is Shadow); otherwise a `shadow`, `warn`, or `block` value
+on the SDK result; otherwise Shadow. A valid `SILMARIL_MODE` wins over both
+the legacy flag and a different mode on the result. An invalid `SILMARIL_MODE`
+is logged and ignored, and it does not fall through to the legacy flag. When
+neither override is set, the SDK client omits `mode` and the backend selects
+the effective mode. During a mixed-version backend response, a configured mode
+stays authoritative, and a mode-less result stays Shadow.
+
+SDK import failure, missing `SILMARIL_API_KEY` or `SILMARIL_API_URL`, network
+and API errors, empty payloads, and other classification errors are logged
+with the error type and fail open. If the SDK raises `FirewallBlockedException`
+and the exception carries a classification result, the plugin uses that result.
+The hook still applies effective mode and the exact `MALICIOUS` prediction. An
+exception without a result fails open.
 
 Only the exact prediction `MALICIOUS` is enforceable. Scores, thresholds,
 outcomes, missing predictions, and unknown predictions remain diagnostic. A
-matching post/transform tool callback pair makes one SDK request, and changed
-content receives a distinct content-sensitive identity. Child lifecycle events
-use the child session as their conversation identity; other events use the
-normal Hermes session. Large strings preserve both their head and tail when
-sanitized for classification.
+successful `post_tool_call` classification is reused by the matching
+`transform_tool_result` when the session, task, tool call id, tool name, and
+content match, so that pair makes one SDK request. A failed observation is not
+cached. Changed content receives a distinct content-sensitive identity. Child
+lifecycle events use the child session as their conversation identity; other
+events use the normal Hermes session. Large strings preserve both their head
+and tail when sanitized for classification.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
 label, tool name, tool call id when present, prediction, readable risk category,
@@ -81,14 +94,17 @@ arguments, tool outputs, assistant text, classifier scores, thresholds, detector
 maps, and raw decision JSON are not emitted in structured logs or model-visible
 context.
 
-Every completed classification also writes one bounded `LocalProtectionEventV1` JSON
-record to the private local evidence spool. The record contains only redacted
-metadata, opaque request/session fingerprints, decision facts, native action,
-and plugin provenance. It never contains raw prompts, arguments, results,
-assistant output, credentials, detector maps, or error bodies. Events always
-report `outcome=not_observed`. Allowed and monitored actions report
-`evidenceTruth=plugin_reported`; returned Hermes native vetoes report
-`evidenceTruth=native_response_returned`. Neither value claims the downstream
+Every hook invocation also attempts to write one bounded `LocalProtectionEventV1` JSON
+record to the private local evidence spool, including fail-open results. The
+record contains redacted metadata, opaque request/session fingerprints,
+decision facts, native action, and plugin provenance. Unit-interval scores and
+thresholds may be stored as `modelScore` and `modelThreshold`. It never
+contains raw prompts, arguments, results, assistant output, credentials,
+detector maps, or error bodies. Events always report `outcome=not_observed`.
+A returned Hermes native veto (`nativeAction=block_returned`) reports
+`evidenceTruth=native_response_returned`. Every other native action, including
+Warn and transform replacement (`nativeAction=content_replaced`), reports
+`evidenceTruth=plugin_reported`. Neither value claims the downstream
 consequence was independently prevented.
 
 Writes are synchronous, per-event, and atomic, with `0700` directory and `0600`
@@ -119,19 +135,31 @@ the process environment used by Hermes at call time. There is no local config
 file parser, credential service, or fallback that writes secrets into plugin
 state.
 
-Every classifier request carries plugin-owned `metadata.silmaril.provenance`. If `SILMARIL_ENDPOINT_ID` is absent, the plugin continues with harness-only provenance.
+Every classifier request carries plugin-owned `metadata.silmaril` with
+`integration` `hermes-firewall`, `version` `0.6.3`, and `provenance`.
+Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
+UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
+with a warning. On macOS, a successful ComputerName lookup can add
+`device_name`. Classification continues when either value is absent.
+`device_name` is not written into local evidence.
 
 ## Enforcement
 
-Hermes supports pre-execution vetoes through `pre_tool_call`. Transform hooks
-can deliver Warn context but never replace completed content in Block mode.
-`post_tool_call`, `subagent_start`, and `subagent_stop` remain observe-only
-because those Hermes hooks have no enforcement return channel. Unsafe delegation
-is blocked at the nearest enforceable gate: the `delegate_task` tool call
-(`DELEGATION_TOOL_NAME` in the plugin) is classified and vetoed by
-`pre_tool_call` before the child agent starts. Child
-agent prompts, tool calls, tool results, and final outputs are scanned through
-the same normal hook path used for parent sessions.
+`pre_tool_call` is the pre-execution veto. In Block mode a malicious result
+returns `{"action": "block", "message": "..."}`. `post_tool_call` is
+observe-only and returns `None` in every mode, including Block.
+`transform_tool_result` and `transform_llm_output` are the native replacement
+hooks: a malicious Block decision replaces the completed tool result or
+assistant output with fixed, content-free text. Warn context is returned from
+`pre_llm_call`. `transform_tool_result` keeps the original tool result and
+appends the same warning. `transform_llm_output` returns the original
+assistant text in Warn mode. `subagent_start` and `subagent_stop` remain
+observe-only because those Hermes hooks have no enforcement return channel.
+Unsafe delegation is blocked at the nearest enforceable gate: the
+`delegate_task` tool call (`DELEGATION_TOOL_NAME` in the plugin) is classified
+and vetoed by `pre_tool_call` before the child agent starts. Child agent
+prompts, tool calls, tool results, and final outputs are scanned through the
+same normal hook path used for parent sessions.
 
 By default, neither mode variable is set and the backend selects the effective mode.
 
@@ -148,9 +176,16 @@ shape with readable copy:
 Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.
 ```
 
-Malicious Block decisions at transform hooks replace the original content with
-fixed, content-free text. Warn output is fixed and never includes raw content,
-arguments, results, secrets, scores, thresholds, detector maps, or hidden policy.
+Malicious Block decisions at the transform hooks use the same fixed shape.
+For a `control_abuse` or `prompt_injection` result the replacements are:
+
+```text
+Silmaril Firewall blocked this tool result: Unsafe agent control attempt. Continue without using the blocked content.
+Silmaril Firewall blocked this assistant output: Unsafe agent control attempt. Continue without using the blocked content.
+```
+
+The warning string is fixed. It does not include raw prompts, arguments,
+secrets, scores, thresholds, detector maps, or hidden policy.
 
 ## Public Demo
 
