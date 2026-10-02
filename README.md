@@ -94,7 +94,7 @@ arguments, tool outputs, assistant text, classifier scores, thresholds, detector
 maps, and raw decision JSON are not emitted in structured logs or model-visible
 context.
 
-Every hook invocation also writes one bounded `LocalProtectionEventV1` JSON
+Every hook invocation also attempts to write one bounded `LocalProtectionEventV1` JSON
 record to the private local evidence spool, including fail-open results. The
 record contains redacted metadata, opaque request/session fingerprints,
 decision facts, native action, and plugin provenance. Unit-interval scores and
