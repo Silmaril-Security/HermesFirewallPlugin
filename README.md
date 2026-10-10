@@ -84,8 +84,19 @@ successful `post_tool_call` classification is reused by the matching
 content match, so that pair makes one SDK request. A failed observation is not
 cached. Changed content receives a distinct content-sensitive identity. Child
 lifecycle events use the child session as their conversation identity; other
-events use the normal Hermes session. Large strings preserve both their head
-and tail when sanitized for classification.
+events use the normal Hermes session.
+
+Every SDK submission, including serialized structured tool arguments, is
+strictly limited by `HERMES_FIREWALL_MAX_PAYLOAD_CHARS`. Oversized text samples
+the head and tail with a short omission marker included in the character limit;
+very small positive limits use a deterministic prefix. Invalid and nonpositive
+values use the default. Request identity, tool-result cache identity, local
+protection evidence, and content returned to Hermes remain based on the
+original full event text.
+
+This sampling omits the middle of oversized content. A result therefore covers
+only the submitted sample and is not proof that the full input was classified.
+Payload overflow does not itself create an enforcement decision.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
 label, tool name, tool call id when present, prediction, readable risk category,
@@ -125,7 +136,7 @@ Optional environment variables:
 - `SILMARIL_ENDPOINT_ID` is the canonical UUID v4 supplied by the Silmaril endpoint app.
 - `HERMES_FIREWALL_SDK_TIMEOUT_SECONDS` controls the SDK request timeout. Default: `2.0`.
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
-- `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` caps large string fields. Default: `8000`.
+- `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` strictly caps each complete text submitted to the SDK, including serialized tool arguments. Default: `8000`.
 - `SILMARIL_MODE` optionally overrides the backend with `shadow`, `warn`, or `block`.
 - `HERMES_FIREWALL_BLOCK_MALICIOUS` is the deprecated legacy mapping; true maps to Block and false maps to Shadow.
 - `SILMARIL_LOCAL_EVENT_DIR` directly overrides the incoming evidence directory. It is primarily intended for testing and nonstandard installations.
