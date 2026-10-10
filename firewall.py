@@ -39,6 +39,7 @@ DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
 DEFAULT_MAX_COLLECTION_ITEMS = 50
+PAYLOAD_OMISSION_MARKER = "...[cut]..."
 DELEGATION_TOOL_NAME = "delegate_task"
 WARN_CONTEXT = (
     "Silmaril Firewall warning: potentially unsafe content was detected. "
@@ -85,18 +86,6 @@ def _float_env(name: str, default: float) -> float:
     return max(0.1, parsed)
 
 
-def _int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError:
-        LOGGER.warning("[%s] invalid %s=%r; using %s", PLUGIN_NAME, name, value, default)
-        return default
-    return max(128, parsed)
-
-
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -111,28 +100,59 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _max_payload_chars() -> int:
-    return _int_env("HERMES_FIREWALL_MAX_PAYLOAD_CHARS", DEFAULT_MAX_PAYLOAD_CHARS)
+    value = os.getenv("HERMES_FIREWALL_MAX_PAYLOAD_CHARS")
+    if not value:
+        return DEFAULT_MAX_PAYLOAD_CHARS
+    try:
+        parsed = int(value)
+    except ValueError:
+        LOGGER.warning(
+            "[%s] invalid HERMES_FIREWALL_MAX_PAYLOAD_CHARS=%r; using %s",
+            PLUGIN_NAME,
+            value,
+            DEFAULT_MAX_PAYLOAD_CHARS,
+        )
+        return DEFAULT_MAX_PAYLOAD_CHARS
+    if parsed <= 0:
+        LOGGER.warning(
+            "[%s] invalid HERMES_FIREWALL_MAX_PAYLOAD_CHARS=%r; using %s",
+            PLUGIN_NAME,
+            value,
+            DEFAULT_MAX_PAYLOAD_CHARS,
+        )
+        return DEFAULT_MAX_PAYLOAD_CHARS
+    return parsed
+
+
+def _bound_text(value: str, max_chars: int) -> str:
+    """Bound text strictly, sampling both ends when the marker fits."""
+    if max_chars <= 0:
+        return ""
+    if len(value) <= max_chars:
+        return value
+
+    sampled_chars = max_chars - len(PAYLOAD_OMISSION_MARKER)
+    if sampled_chars < 2:
+        return value[:max_chars]
+
+    head_chars = (sampled_chars + 1) // 2
+    tail_chars = sampled_chars - head_chars
+    return (
+        f"{value[:head_chars]}"
+        f"{PAYLOAD_OMISSION_MARKER}"
+        f"{value[-tail_chars:]}"
+    )
 
 
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
     if depth > 6:
-        return repr(value)
+        return _bound_text(repr(value), _max_payload_chars())
 
     if value is None or isinstance(value, (bool, int, float)):
         return value
 
     if isinstance(value, str):
-        max_chars = _max_payload_chars()
-        if len(value) <= max_chars:
-            return value
-        head_chars = max_chars // 2
-        tail_chars = max_chars - head_chars
-        omitted = len(value) - head_chars - tail_chars
-        return (
-            f"{value[:head_chars]}"
-            f"...[truncated {omitted} chars]..."
-            f"{value[-tail_chars:]}"
-        )
+        return _bound_text(value, _max_payload_chars())
 
     if isinstance(value, bytes):
         return _json_safe(value.decode("utf-8", errors="replace"), depth=depth + 1)
@@ -155,6 +175,29 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
         if len(values) > DEFAULT_MAX_COLLECTION_ITEMS:
             safe_values.append({"_truncated_items": len(values) - DEFAULT_MAX_COLLECTION_ITEMS})
         return safe_values
+
+    return _bound_text(repr(value), _max_payload_chars())
+
+
+def _json_full(value: Any, *, depth: int = 0) -> Any:
+    """Create a JSON-compatible representation without payload sampling."""
+    if depth > 6:
+        return repr(value)
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_full(item_value, depth=depth + 1)
+            for key, item_value in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_full(item, depth=depth + 1) for item in value]
 
     return repr(value)
 
@@ -263,6 +306,12 @@ def _text_for_classification(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
+
+
+def _full_event_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(_json_full(value), ensure_ascii=False, sort_keys=True)
 
 
 def _metadata_value(value: Any) -> Any:
@@ -424,12 +473,15 @@ def _classify(
     text: str,
     tool_name: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    original_text: str | None = None,
 ) -> dict[str, Any] | None:
     if not text or not text.strip():
         _log("classify_skipped", hook_event=event, hook=hook_name, reason="empty_text")
         return None
 
     try:
+        full_text = text if original_text is None else original_text
+        submitted_text = _bound_text(text, _max_payload_chars())
         client = _firewall_client()
         _, HookLabel, FirewallBlockedException = _sdk_symbols()
         hook = getattr(HookLabel, hook_name)
@@ -438,12 +490,12 @@ def _classify(
             "tool_name": tool_name,
             "metadata": _with_provenance(metadata),
         }
-        request_id = _stable_request_id(event, metadata or {}, text)
+        request_id = _stable_request_id(event, metadata or {}, full_text)
         if request_id is not None:
             classify_options["request_id"] = request_id
         try:
             result = client.classify(
-                text,
+                submitted_text,
                 **classify_options,
             )
         except FirewallBlockedException as exc:
@@ -485,6 +537,7 @@ def _observe(
     hook_name: str,
     text: str,
     tool_name: str | None = None,
+    original_text: str | None = None,
 ) -> dict[str, Any] | None:
     _log(event, **fields)
     return _classify(
@@ -493,6 +546,7 @@ def _observe(
         text,
         tool_name=tool_name,
         metadata=_metadata(event, fields),
+        original_text=original_text,
     )
 
 
@@ -755,15 +809,16 @@ def pre_tool_call(
         "tool_name": tool_name or "-",
         "arg_keys": _keys(args or {}),
     }
-    classified_text = _text_for_classification(
-        {"tool_name": tool_name, "args": args or {}}
-    )
+    structured_payload = {"tool_name": tool_name, "args": args or {}}
+    classified_text = _text_for_classification(structured_payload)
+    original_text = _full_event_text(structured_payload)
     result = _observe(
         "pre_tool_call",
         fields,
         "TOOL_CALL",
         classified_text,
         tool_name=tool_name or None,
+        original_text=original_text,
     )
     mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
         result,
@@ -773,7 +828,7 @@ def pre_tool_call(
     _record_local_evidence(
         event="pre_tool_call",
         hook="pre_tool",
-        raw_text=classified_text,
+        raw_text=original_text,
         fields=fields,
         result=result,
         mode=mode,

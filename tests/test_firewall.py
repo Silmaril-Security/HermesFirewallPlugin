@@ -17,6 +17,7 @@ from typing import Any
 from unittest import mock
 
 import firewall
+import local_evidence
 
 
 ENV_KEYS = {
@@ -964,13 +965,194 @@ class HermesFirewallTests(unittest.TestCase):
         )
         self.assertIsNone(firewall._stable_request_id("pre_llm_call", {}, "one"))
 
-    def test_head_and_tail_sanitization_preserves_both_boundaries(self) -> None:
+    def test_bounding_helper_is_strict_and_preserves_both_boundaries(self) -> None:
         reset_state(HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128")
         raw = "HEAD" + ("x" * 300) + "TAIL"
         sanitized = firewall._json_safe(raw)
+        self.assertEqual(len(sanitized), 128)
         self.assertTrue(sanitized.startswith("HEAD"))
         self.assertTrue(sanitized.endswith("TAIL"))
-        self.assertIn("[truncated 180 chars]", sanitized)
+        self.assertIn(firewall.PAYLOAD_OMISSION_MARKER, sanitized)
+
+    def test_json_safe_keeps_distinct_long_mapping_keys_before_final_sampling(self) -> None:
+        reset_state(HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128")
+        first_key = ("H" * 80) + "first-middle" + ("T" * 80)
+        second_key = ("H" * 80) + "second-middle" + ("T" * 80)
+
+        safe = firewall._json_safe({first_key: "first", second_key: "second"})
+
+        self.assertEqual(safe, {first_key: "first", second_key: "second"})
+        serialized = firewall._text_for_classification(safe)
+        self.assertIn(first_key, serialized)
+        self.assertIn(second_key, serialized)
+        self.assertLessEqual(
+            len(firewall._bound_text(serialized, firewall._max_payload_chars())),
+            128,
+        )
+
+    def test_classification_budget_applies_to_actual_hook_flow(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128",
+        )
+        raw = "HEAD" + ("x" * 300) + "TAIL"
+        structured_payload = {"tool_name": "terminal", "args": {"command": raw}}
+        original_tool_text = firewall._full_event_text(structured_payload)
+        evidence: list[dict[str, Any]] = []
+
+        with mock.patch.object(
+            firewall,
+            "_LOCAL_EVIDENCE_EMITTER",
+            side_effect=evidence.append,
+        ):
+            self.assertIsNone(
+                firewall.pre_llm_call(user_message=raw, session_id="session-budget")
+            )
+            self.assertIsNone(
+                firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": raw},
+                    session_id="session-budget",
+                    tool_call_id="tool-budget",
+                )
+            )
+            self.assertEqual(
+                firewall.transform_tool_result(
+                    tool_name="terminal",
+                    result=raw,
+                    session_id="session-budget",
+                    tool_call_id="transform-budget",
+                ),
+                raw,
+            )
+            self.assertIsNone(
+                firewall.post_tool_call(
+                    tool_name="terminal",
+                    result=raw,
+                    session_id="session-budget",
+                    tool_call_id="tool-budget",
+                )
+            )
+            calls_after_post_tool = len(FakeFirewall.calls)
+            self.assertEqual(
+                firewall.transform_tool_result(
+                    tool_name="terminal",
+                    result=raw,
+                    session_id="session-budget",
+                    tool_call_id="tool-budget",
+                ),
+                raw,
+            )
+            self.assertEqual(len(FakeFirewall.calls), calls_after_post_tool)
+            self.assertEqual(
+                firewall.transform_llm_output(
+                    response_text=raw,
+                    session_id="session-budget",
+                    task_id="task-budget",
+                ),
+                raw,
+            )
+
+        self.assertEqual(
+            [call["options"]["hook"].value for call in FakeFirewall.calls],
+            [
+                "user_input",
+                "tool_call",
+                "tool_response",
+                "tool_response",
+                "llm_output",
+            ],
+        )
+        for call in FakeFirewall.calls:
+            submitted = call["text"]
+            self.assertLessEqual(len(submitted), 128)
+            self.assertIn("HEAD", submitted)
+            self.assertIn("TAIL", submitted)
+            self.assertIn(firewall.PAYLOAD_OMISSION_MARKER, submitted)
+
+        pre_tool_call = FakeFirewall.calls[1]
+        self.assertEqual(
+            pre_tool_call["options"]["request_id"],
+            firewall._stable_request_id(
+                "pre_tool_call",
+                pre_tool_call["options"]["metadata"],
+                original_tool_text,
+            ),
+        )
+        self.assertEqual(
+            evidence[1]["requestFingerprint"],
+            local_evidence._request_fingerprint(
+                "pre_tool_call",
+                "pre_tool_call:tool_call_id:tool-budget",
+                original_tool_text,
+            ),
+        )
+        self.assertEqual(
+            evidence[2]["requestFingerprint"],
+            local_evidence._request_fingerprint(
+                "transform_tool_result",
+                "transform_tool_result:tool_call_id:transform-budget",
+                raw,
+            ),
+        )
+        self.assertEqual(
+            evidence[3]["requestFingerprint"],
+            local_evidence._request_fingerprint(
+                "post_tool_call",
+                "post_tool_call:tool_call_id:tool-budget",
+                raw,
+            ),
+        )
+        self.assertEqual(
+            evidence[4]["requestFingerprint"],
+            local_evidence._request_fingerprint(
+                "transform_tool_result",
+                "transform_tool_result:tool_call_id:tool-budget",
+                raw,
+            ),
+        )
+        self.assertEqual(
+            evidence[5]["requestFingerprint"],
+            local_evidence._request_fingerprint(
+                "transform_llm_output",
+                "transform_llm_output:task_id:task-budget",
+                raw,
+            ),
+        )
+
+    def test_exact_boundary_and_tiny_positive_budgets_are_strict(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128",
+        )
+        boundary = "b" * 128
+        firewall.pre_llm_call(user_message=boundary)
+        self.assertEqual(FakeFirewall.calls[0]["text"], boundary)
+
+        for limit in (1, 2, 3):
+            with self.subTest(limit=limit):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    HERMES_FIREWALL_MAX_PAYLOAD_CHARS=str(limit),
+                )
+                firewall.pre_llm_call(user_message="abcdef")
+                self.assertEqual(FakeFirewall.calls[0]["text"], "abcdef"[:limit])
+
+    def test_invalid_and_nonpositive_payload_budgets_use_default(self) -> None:
+        for value in ("invalid", "0", "-1"):
+            with self.subTest(value=value):
+                reset_state(HERMES_FIREWALL_MAX_PAYLOAD_CHARS=value)
+                with self.assertLogs(
+                    "hermes.plugins.firewall",
+                    level="WARNING",
+                ):
+                    self.assertEqual(
+                        firewall._max_payload_chars(),
+                        firewall.DEFAULT_MAX_PAYLOAD_CHARS,
+                    )
 
     def test_exact_malicious_prediction_overrides_diagnostic_outcome(self) -> None:
         reset_state(

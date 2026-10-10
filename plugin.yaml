@@ -29,6 +29,6 @@ optional_env:
   - name: HERMES_FIREWALL_SDK_MAX_RETRIES
     description: SDK retry count. Defaults to 0.
   - name: HERMES_FIREWALL_MAX_PAYLOAD_CHARS
-    description: Maximum classified payload length. Defaults to 8000 characters.
+    description: Strict SDK submission limit in characters; oversized text samples the head and tail, so it is not full-input classification proof. Defaults to 8000.
   - name: SILMARIL_LOCAL_EVENT_DIR
     description: Direct override for the private LocalProtectionEventV1 incoming directory.
