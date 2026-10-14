@@ -66,8 +66,9 @@ Block and `false` is Shadow); otherwise a `shadow`, `warn`, or `block` value
 on the SDK result; otherwise Shadow. A valid `SILMARIL_MODE` wins over both
 the legacy flag and a different mode on the result. An invalid `SILMARIL_MODE`
 is logged and ignored, and it does not fall through to the legacy flag. When
-neither override is set, the SDK client omits `mode` and the backend selects
-the effective mode. During a mixed-version backend response, a configured mode
+neither override is set, the SDK client omits `mode`. Current classify responses
+also omit mode, so the plugin falls back to Shadow; select Warn or Block
+explicitly when intended. A valid legacy response mode remains compatible. During a mixed-version backend response, a configured mode
 stays authoritative, and a mode-less result stays Shadow.
 
 SDK import failure, missing `SILMARIL_API_KEY` or `SILMARIL_API_URL`, network
@@ -137,7 +138,7 @@ Optional environment variables:
 - `HERMES_FIREWALL_SDK_TIMEOUT_SECONDS` controls the SDK request timeout. Default: `2.0`.
 - `HERMES_FIREWALL_SDK_MAX_RETRIES` controls SDK retries. Default: `0`.
 - `HERMES_FIREWALL_MAX_PAYLOAD_CHARS` strictly caps each complete text submitted to the SDK, including serialized tool arguments. Default: `8000`.
-- `SILMARIL_MODE` optionally overrides the backend with `shadow`, `warn`, or `block`.
+- `SILMARIL_MODE` selects local handling with `shadow`, `warn`, or `block`.
 - `HERMES_FIREWALL_BLOCK_MALICIOUS` is the deprecated legacy mapping; true maps to Block and false maps to Shadow.
 - `SILMARIL_LOCAL_EVENT_DIR` directly overrides the incoming evidence directory. It is primarily intended for testing and nonstandard installations.
 
@@ -172,7 +173,7 @@ and vetoed by `pre_tool_call` before the child agent starts. Child agent
 prompts, tool calls, tool results, and final outputs are scanned through the
 same normal hook path used for parent sessions.
 
-By default, neither mode variable is set and the backend selects the effective mode.
+By default, neither mode variable is set. Current classify responses omit mode, so the plugin falls back to Shadow. Select Warn or Block explicitly when intended.
 
 To enable enforcement at supported boundaries:
 
