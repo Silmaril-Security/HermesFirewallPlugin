@@ -1,6 +1,6 @@
 # Hermes Firewall Installed
 
-This fail-open Silmaril SDK firewall plugin, version 0.6.3, is enabled after Hermes restarts.
+This fail-open Silmaril SDK firewall plugin, version 0.6.4, is enabled after Hermes restarts.
 
 It classifies `pre_llm_call`, `pre_tool_call`, `post_tool_call`,
 `transform_tool_result`, `transform_llm_output`, `subagent_start`, and
