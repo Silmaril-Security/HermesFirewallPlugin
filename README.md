@@ -16,7 +16,7 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-This plugin's manifest version is 0.6.3 (`plugin.yaml` and `PLUGIN_VERSION`
+This plugin's manifest version is 0.6.4 (`plugin.yaml` and `PLUGIN_VERSION`
 in `firewall.py`). It requires Silmaril Security SDK 0.6.0, the version pinned
 in `requirements.txt`, in the same Python environment that runs Hermes:
 
@@ -148,7 +148,7 @@ file parser, credential service, or fallback that writes secrets into plugin
 state.
 
 Every classifier request carries plugin-owned `metadata.silmaril` with
-`integration` `hermes-firewall`, `version` `0.6.3`, and `provenance`.
+`integration` `hermes-firewall`, `version` `0.6.4`, and `provenance`.
 Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
 UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
 with a warning. On macOS, a successful ComputerName lookup can add

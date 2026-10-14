@@ -34,7 +34,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.3"
+PLUGIN_VERSION = "0.6.4"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
