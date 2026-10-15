@@ -1,9 +1,13 @@
 """Fail-open Silmaril Firewall SDK hooks for Hermes.
 
 This plugin classifies Hermes hook payloads with the Silmaril Security SDK.
-When mode is omitted, the backend controls behavior. SDK errors are logged
-without raw payloads and fail open. Warn uses only Hermes context-return
-surfaces, and Block uses only a genuine native veto.
+A valid SILMARIL_MODE wins. The deprecated legacy flag is consulted only when
+SILMARIL_MODE is absent or blank; a nonempty invalid value skips that flag.
+When no local mode is selected, historical response modes remain
+compatibility-only and mode-less responses fall back to Shadow, so Warn or
+Block must be configured explicitly. SDK errors are logged without raw
+payloads and fail open. Warn uses only Hermes context-return surfaces, and
+Block uses only a genuine native veto.
 """
 
 from __future__ import annotations
@@ -229,7 +233,12 @@ def _configured_mode() -> str | None:
         normalized = explicit.strip().lower()
         if normalized in {"shadow", "warn", "block"}:
             return normalized
-        LOGGER.warning("[%s] invalid SILMARIL_MODE=%r; using backend mode", PLUGIN_NAME, explicit)
+        LOGGER.warning(
+            "[%s] invalid SILMARIL_MODE=%r; ignoring it "
+            "(legacy flag not consulted; historical response mode or Shadow fallback applies)",
+            PLUGIN_NAME,
+            explicit,
+        )
         return None
 
     legacy = os.getenv("HERMES_FIREWALL_BLOCK_MALICIOUS")
