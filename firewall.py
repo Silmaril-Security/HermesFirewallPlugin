@@ -1,11 +1,13 @@
 """Fail-open Silmaril Firewall SDK hooks for Hermes.
 
 This plugin classifies Hermes hook payloads with the Silmaril Security SDK.
-Local mode precedence is SILMARIL_MODE, then the deprecated legacy flag.
-Historical response modes remain compatible; mode-less responses fall back to
-Shadow, so Warn or Block must be configured explicitly. SDK errors are logged
-without raw payloads and fail open. Warn uses only Hermes context-return
-surfaces, and Block uses only a genuine native veto.
+A valid SILMARIL_MODE wins. The deprecated legacy flag is consulted only when
+SILMARIL_MODE is absent or blank; a nonempty invalid value skips that flag.
+When no local mode is selected, historical response modes remain
+compatibility-only and mode-less responses fall back to Shadow, so Warn or
+Block must be configured explicitly. SDK errors are logged without raw
+payloads and fail open. Warn uses only Hermes context-return surfaces, and
+Block uses only a genuine native veto.
 """
 
 from __future__ import annotations

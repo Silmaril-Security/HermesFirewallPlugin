@@ -7,13 +7,14 @@ It classifies `pre_llm_call`, `pre_tool_call`, `post_tool_call`,
 `subagent_stop` with the Silmaril Security SDK. SDK output is logged for each
 call without raw classified text. SDK failures are logged and fail open. A
 `FirewallBlockedException` that includes a classification result supplies that
-result for the effective-mode decision and is not treated as an outage. Local
-mode precedence is a valid `SILMARIL_MODE`, then the deprecated
-`HERMES_FIREWALL_BLOCK_MALICIOUS` flag. Historical response modes remain
-accepted only for compatibility when no local mode is configured. A response
-without a mode falls back to Shadow and does not block tools, inject context,
-or rewrite results. Set `SILMARIL_MODE=warn` or `SILMARIL_MODE=block`
-explicitly when that handling is intended.
+result for the effective-mode decision and is not treated as an outage. A valid
+`SILMARIL_MODE` wins. The deprecated `HERMES_FIREWALL_BLOCK_MALICIOUS` flag is
+consulted only when `SILMARIL_MODE` is absent or blank; a nonempty invalid
+`SILMARIL_MODE` skips the legacy flag. If those rules select no local mode, a
+historical response mode remains accepted only for compatibility, and a
+mode-less response falls back to Shadow without blocking tools, injecting
+context, or rewriting results. Set `SILMARIL_MODE=warn` or
+`SILMARIL_MODE=block` explicitly when that handling is intended.
 
 Hook decisions are also written as private, bounded `LocalProtectionEventV1`
 records under `~/Library/Application Support/Silmaril/Evidence/incoming`.
