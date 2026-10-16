@@ -1,6 +1,6 @@
 # Hermes Firewall Installed
 
-This fail-open Silmaril SDK firewall plugin, version 0.6.4, is enabled after Hermes restarts.
+This fail-open Silmaril SDK firewall plugin, version 0.6.5, is enabled after Hermes restarts.
 
 It classifies `pre_llm_call`, `pre_tool_call`, `post_tool_call`,
 `transform_tool_result`, `transform_llm_output`, `subagent_start`, and
@@ -15,6 +15,10 @@ historical response mode remains accepted only for compatibility, and a
 mode-less response falls back to Shadow without blocking tools, injecting
 context, or rewriting results. Set `SILMARIL_MODE=warn` or
 `SILMARIL_MODE=block` explicitly when that handling is intended.
+The supported local modes are exactly Shadow, Warn, and Block. A result is a
+block candidate when its model prediction is `MALICIOUS` or its typed
+governance decision has `action=block`. A governance-only denial retains its
+benign model prediction and uses readable policy-denial copy.
 
 Hook decisions are also written as private, bounded `LocalProtectionEventV1`
 records under `~/Library/Application Support/Silmaril/Evidence/incoming`.
@@ -35,7 +39,7 @@ SILMARIL_MODE=block
 Install the SDK in the Hermes Python environment:
 
 ```bash
-pip install silmaril-security-sdk==0.6.0
+pip install silmaril-security-sdk==0.7.3
 ```
 
 Set required `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes

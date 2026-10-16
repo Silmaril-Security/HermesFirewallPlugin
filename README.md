@@ -2,10 +2,11 @@
 
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
 with the Silmaril Security SDK. Shadow is silent. Warn adds one bounded warning
-on supported same-turn surfaces. Block vetoes malicious `pre_tool_call` events.
+on supported same-turn surfaces. Block vetoes `pre_tool_call` events when the
+model predicts `MALICIOUS` or governance returns `action=block`.
 `post_tool_call` is observe-only. `transform_tool_result` and
-`transform_llm_output` replace malicious Block output with fixed, content-free
-text. Hooks without an enforcement return leave completed content unchanged.
+`transform_llm_output` replace Block candidates with fixed, content-free text.
+Hooks without an enforcement return leave completed content unchanged.
 
 ## Install
 
@@ -16,12 +17,14 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-This plugin's manifest version is 0.6.4 (`plugin.yaml` and `PLUGIN_VERSION`
-in `firewall.py`). It requires Silmaril Security SDK 0.6.0, the version pinned
-in `requirements.txt`, in the same Python environment that runs Hermes:
+This source tree prepares plugin version 0.6.5 (`plugin.yaml` and
+`PLUGIN_VERSION` in `firewall.py`). That is release-preparation metadata, not a
+claim that 0.6.5 is published or installed. It requires the published Silmaril
+Security SDK 0.7.3, the version pinned in `requirements.txt`, in the same Python
+environment that runs Hermes:
 
 ```bash
-pip install silmaril-security-sdk==0.6.0
+pip install silmaril-security-sdk==0.7.3
 ```
 
 Copy `.env.example` into your Hermes environment manager or shell profile and
@@ -49,10 +52,10 @@ hermes gateway restart
 The plugin registers seven hooks:
 
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
-- `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the classifier returns a malicious result.
+- `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the result is a block candidate.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
 - `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block replaces the result before model reuse.
-- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and replaces malicious Block output before delivery.
+- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and replaces Block-candidate output before delivery.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
@@ -75,12 +78,15 @@ SDK import failure, missing `SILMARIL_API_KEY` or `SILMARIL_API_URL`, network
 and API errors, empty payloads, and other classification errors are logged
 with the error type and fail open. If the SDK raises `FirewallBlockedException`
 and the exception carries a classification result, the plugin uses that result.
-The hook still applies effective mode and the exact `MALICIOUS` prediction. An
-exception without a result fails open.
+The hook still applies effective mode and the shared block-candidate predicate.
+An exception without a result fails open.
 
-Only the exact prediction `MALICIOUS` is enforceable. Scores, thresholds,
-outcomes, missing predictions, and unknown predictions remain diagnostic. A
-successful `post_tool_call` classification is reused by the matching
+The shared block-candidate predicate is an exact `MALICIOUS` prediction or a
+typed SDK `GovernanceDecision` with `action=block`. Governance `action=allow`,
+absent governance, scores, thresholds, outcomes, missing predictions, and
+unknown predictions do not create a candidate. A governance-only denial keeps
+the model prediction `BENIGN`; it is not relabeled as malicious. A successful
+`post_tool_call` classification is reused by the matching
 `transform_tool_result` when the session, task, tool call id, tool name, and
 content match, so that pair makes one SDK request. A failed observation is not
 cached. Changed content receives a distinct content-sensitive identity. Child
@@ -101,7 +107,7 @@ Payload overflow does not itself create an enforcement decision.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
 label, tool name, tool call id when present, prediction, readable risk category,
-and whether the SDK classified the event as blocked. Raw prompts, tool
+and whether the result is a block candidate. Raw governance objects, prompts, tool
 arguments, tool outputs, assistant text, classifier scores, thresholds, detector
 maps, and raw decision JSON are not emitted in structured logs or model-visible
 context.
@@ -148,7 +154,7 @@ file parser, credential service, or fallback that writes secrets into plugin
 state.
 
 Every classifier request carries plugin-owned `metadata.silmaril` with
-`integration` `hermes-firewall`, `version` `0.6.4`, and `provenance`.
+`integration` `hermes-firewall`, `version` `0.6.5`, and `provenance`.
 Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
 UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
 with a warning. On macOS, a successful ComputerName lookup can add
@@ -157,11 +163,11 @@ with a warning. On macOS, a successful ComputerName lookup can add
 
 ## Enforcement
 
-`pre_tool_call` is the pre-execution veto. In Block mode a malicious result
+`pre_tool_call` is the pre-execution veto. In Block mode a block candidate
 returns `{"action": "block", "message": "..."}`. `post_tool_call` is
 observe-only and returns `None` in every mode, including Block.
 `transform_tool_result` and `transform_llm_output` are the native replacement
-hooks: a malicious Block decision replaces the completed tool result or
+hooks: a Block decision replaces the completed tool result or
 assistant output with fixed, content-free text. Warn context is returned from
 `pre_llm_call`. `transform_tool_result` keeps the original tool result and
 appends the same warning. `transform_llm_output` returns the original
@@ -173,7 +179,12 @@ and vetoed by `pre_tool_call` before the child agent starts. Child agent
 prompts, tool calls, tool results, and final outputs are scanned through the
 same normal hook path used for parent sessions.
 
-By default, neither mode variable is set. Current classify responses omit mode, so the plugin falls back to Shadow. Select Warn or Block explicitly when intended.
+Supported local modes are exactly `shadow`, `warn`, and `block`. By default,
+neither mode variable is set. Current classify responses omit mode, so the
+plugin falls back to Shadow. Select Warn or Block explicitly when intended.
+Warn uses only the existing same-turn warning-context surfaces. Block uses only
+the existing native pre-tool veto and transform replacements. Observe-only
+hooks remain observe-only in every mode.
 
 To enable enforcement at supported boundaries:
 
@@ -181,8 +192,8 @@ To enable enforcement at supported boundaries:
 SILMARIL_MODE=block
 ```
 
-When enabled, malicious `pre_tool_call` classifications return the Hermes veto
-shape with readable copy:
+When enabled, block-candidate `pre_tool_call` classifications return the Hermes
+veto shape with readable copy:
 
 ```text
 Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.

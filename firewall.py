@@ -38,7 +38,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.4"
+PLUGIN_VERSION = "0.6.5"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -298,16 +298,39 @@ def _result_dict(result: Any) -> dict[str, Any]:
     score = getattr(result, "score", None)
     threshold = getattr(result, "threshold", None)
     prediction = getattr(result, "prediction", None)
-    return {
+    projected = {
         "prediction": prediction,
         "score": score,
         "threshold": threshold,
-        "blocked": prediction == "MALICIOUS",
         "mode": getattr(result, "mode", None),
+        "governance": _project_governance_decision(result),
         "primary_outcome": getattr(result, "primary_outcome", None),
         "outcome_scores": getattr(result, "outcome_scores", None),
         "detector_scores": getattr(result, "detector_scores", None),
         "detector_counts": getattr(result, "detector_counts", None),
+    }
+    projected["blocked"] = _is_block_candidate(projected)
+    return projected
+
+
+def _project_governance_decision(result: Any) -> dict[str, str | None] | None:
+    """Project only the public typed GovernanceDecision fields."""
+    decision = getattr(result, "governance", None)
+    if decision is None:
+        return None
+    action = getattr(decision, "action", None)
+    policy_version = getattr(decision, "policy_version", None)
+    rule_id = getattr(decision, "rule_id", None)
+    if action not in {"allow", "block"}:
+        return None
+    if not isinstance(policy_version, str) or not policy_version:
+        return None
+    if rule_id is not None and not isinstance(rule_id, str):
+        return None
+    return {
+        "action": action,
+        "policy_version": policy_version,
+        "rule_id": rule_id,
     }
 
 
@@ -559,8 +582,20 @@ def _observe(
     )
 
 
-def _is_malicious(result: Mapping[str, Any] | None) -> bool:
+def _is_model_malicious(result: Mapping[str, Any] | None) -> bool:
     return result is not None and result.get("prediction") == "MALICIOUS"
+
+
+def _is_governance_block(result: Mapping[str, Any] | None) -> bool:
+    if result is None:
+        return False
+    governance = result.get("governance")
+    return isinstance(governance, Mapping) and governance.get("action") == "block"
+
+
+def _is_block_candidate(result: Mapping[str, Any] | None) -> bool:
+    """Return the single candidate decision used by every plugin boundary."""
+    return _is_model_malicious(result) or _is_governance_block(result)
 
 
 def _effective_mode(result: Mapping[str, Any] | None) -> str:
@@ -587,7 +622,7 @@ def _local_evidence_decision(
     block_unavailable = False
     if result is None:
         policy_decision = "unavailable"
-    elif _is_malicious(result):
+    elif _is_block_candidate(result):
         if mode == "block" and block_action is not None:
             policy_decision = "block"
         elif mode == "warn" and warn_action is not None:
@@ -719,13 +754,16 @@ def _block_message(result: Mapping[str, Any], subject: str) -> str:
 
 
 def _risk_label(result: Mapping[str, Any]) -> str:
+    candidate = _is_block_candidate(result)
+    if _is_governance_block(result) and not _is_model_malicious(result):
+        return "Governance policy denied this action"
     outcome = result.get("primary_outcome")
     normalized = outcome.strip().lower() if isinstance(outcome, str) else ""
     normalized = normalized.replace("-", "_").replace(" ", "_")
     if not normalized:
-        return "Unsafe content" if _is_malicious(result) else "No flagged risk"
+        return "Unsafe content" if candidate else "No flagged risk"
     if normalized == "benign":
-        return "Unexpected classification conflict" if _is_malicious(result) else "No flagged risk"
+        return "Unexpected classification conflict" if candidate else "No flagged risk"
     labels = {
         "prompt_injection": "Unsafe agent control attempt",
         "control_abuse": "Unsafe agent control attempt",
