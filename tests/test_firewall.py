@@ -48,6 +48,13 @@ class FakeHookLabel:
 
 
 @dataclass(frozen=True)
+class FakeGovernanceDecision:
+    action: str
+    policy_version: str = "synthetic-policy-v1"
+    rule_id: str | None = "synthetic-rule"
+
+
+@dataclass(frozen=True)
 class FakeResult:
     prediction: str = "BENIGN"
     score: float = 0.01
@@ -57,6 +64,7 @@ class FakeResult:
     detector_scores: dict[str, float] | None = None
     detector_counts: dict[str, int] | None = None
     mode: str | None = "shadow"
+    governance: FakeGovernanceDecision | None = None
 
 
 class FakeFirewallBlockedException(Exception):
@@ -82,7 +90,11 @@ class FakeFirewall:
         requested_mode = self.options.get("mode")
         result = replace(self.next_result, mode=requested_mode or self.next_result.mode)
         effective_mode = requested_mode or result.mode or "block"
-        if result.prediction == "MALICIOUS" and effective_mode == "block":
+        governance_block = (
+            result.governance is not None
+            and result.governance.action == "block"
+        )
+        if (result.prediction == "MALICIOUS" or governance_block) and effective_mode == "block":
             raise FakeFirewallBlockedException(result)
         return result
 
@@ -262,7 +274,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.4")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.5")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -319,7 +331,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.4",
+                "version": "0.6.5",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
@@ -942,13 +954,159 @@ class HermesFirewallTests(unittest.TestCase):
             "allowed output",
         )
 
+    def test_governance_candidates_follow_block_warn_shadow_at_transform_hook(self) -> None:
+        cases = (
+            ("block", FakeGovernanceDecision("block"), "block"),
+            ("warn", FakeGovernanceDecision("block"), "warn"),
+            ("shadow", FakeGovernanceDecision("block"), "monitor"),
+            ("block", FakeGovernanceDecision("allow"), "allow"),
+            ("warn", FakeGovernanceDecision("allow"), "allow"),
+            ("shadow", FakeGovernanceDecision("allow"), "allow"),
+            ("block", None, "allow"),
+            ("warn", None, "allow"),
+            ("shadow", None, "allow"),
+        )
+        for mode, governance, expected_decision in cases:
+            with self.subTest(mode=mode, governance=governance):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE=mode,
+                )
+                FakeFirewall.next_result = FakeResult(
+                    prediction="BENIGN",
+                    score=0.01,
+                    threshold=0.5,
+                    primary_outcome="benign",
+                    governance=governance,
+                )
+                evidence: list[dict[str, Any]] = []
+                raw_result = f"synthetic result {mode} {governance}"
+                with mock.patch.object(
+                    firewall,
+                    "_LOCAL_EVIDENCE_EMITTER",
+                    side_effect=evidence.append,
+                ):
+                    transformed = firewall.transform_tool_result(
+                        tool_name="terminal",
+                        result=raw_result,
+                    )
+
+                if governance is not None and governance.action == "block":
+                    if mode == "block":
+                        self.assertNotIn(raw_result, transformed)
+                        self.assertIn("Governance policy denied this action", transformed)
+                    elif mode == "warn":
+                        self.assertEqual(
+                            transformed,
+                            f"{raw_result}\n\n{firewall.WARN_CONTEXT}",
+                        )
+                    else:
+                        self.assertEqual(transformed, raw_result)
+                else:
+                    self.assertEqual(transformed, raw_result)
+                self.assertEqual(evidence[0]["prediction"], "benign")
+                self.assertEqual(evidence[0]["policyDecision"], expected_decision)
+
+    def test_governance_only_block_returns_native_veto_with_benign_evidence(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="BENIGN",
+            score=0.01,
+            threshold=0.5,
+            primary_outcome="benign",
+            governance=FakeGovernanceDecision("block"),
+        )
+        evidence: list[dict[str, Any]] = []
+        with mock.patch.object(
+            firewall,
+            "_LOCAL_EVIDENCE_EMITTER",
+            side_effect=evidence.append,
+        ):
+            with self.assertLogs("hermes.plugins.firewall", level="INFO") as logs:
+                blocked = firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": "synthetic command"},
+                )
+
+        self.assertEqual(blocked, {
+            "action": "block",
+            "message": (
+                "Silmaril Firewall blocked this tool call: "
+                "Governance policy denied this action. "
+                "Continue without using the blocked content."
+            ),
+        })
+        self.assertEqual(evidence[0]["prediction"], "benign")
+        self.assertEqual(evidence[0]["policyDecision"], "block")
+        self.assertEqual(evidence[0]["nativeAction"], "block_returned")
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("prediction=BENIGN", rendered_logs)
+        self.assertIn("risk=Governance policy denied this action", rendered_logs)
+        self.assertIn("blocked=True", rendered_logs)
+        self.assertNotIn("synthetic-policy-v1", rendered_logs)
+        self.assertNotIn("synthetic-rule", rendered_logs)
+
+    def test_cached_governance_candidate_uses_same_transform_decision(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="BENIGN",
+            primary_outcome="benign",
+            governance=FakeGovernanceDecision("block"),
+        )
+
+        self.assertIsNone(firewall.post_tool_call(
+            tool_name="terminal",
+            result="synthetic result",
+            session_id="session-1",
+            tool_call_id="call-1",
+        ))
+        transformed = firewall.transform_tool_result(
+            tool_name="terminal",
+            result="synthetic result",
+            session_id="session-1",
+            tool_call_id="call-1",
+        )
+
+        self.assertEqual(len(FakeFirewall.calls), 1)
+        self.assertNotIn("synthetic result", transformed)
+        self.assertIn("Governance policy denied this action", transformed)
+
+    def test_result_projection_keeps_only_typed_governance_fields(self) -> None:
+        projected = firewall._result_dict(FakeResult(
+            governance=FakeGovernanceDecision("block"),
+        ))
+
+        self.assertEqual(projected["governance"], {
+            "action": "block",
+            "policy_version": "synthetic-policy-v1",
+            "rule_id": "synthetic-rule",
+        })
+        self.assertTrue(projected["blocked"])
+
     def test_unknown_missing_and_score_only_results_fail_open(self) -> None:
-        self.assertFalse(firewall._is_malicious(None))
-        self.assertFalse(firewall._is_malicious({}))
-        self.assertFalse(firewall._is_malicious({"prediction": "UNKNOWN", "score": 1.0}))
-        self.assertFalse(firewall._is_malicious({"prediction": "malicious", "blocked": True}))
-        self.assertFalse(firewall._is_malicious({"prediction": "BENIGN", "score": 1.0}))
-        self.assertTrue(firewall._is_malicious({"prediction": "MALICIOUS", "score": 0.0}))
+        self.assertFalse(firewall._is_block_candidate(None))
+        self.assertFalse(firewall._is_block_candidate({}))
+        self.assertFalse(firewall._is_block_candidate({"prediction": "UNKNOWN", "score": 1.0}))
+        self.assertFalse(firewall._is_block_candidate({"prediction": "malicious", "blocked": True}))
+        self.assertFalse(firewall._is_block_candidate({"prediction": "BENIGN", "score": 1.0}))
+        self.assertFalse(firewall._is_block_candidate({
+            "prediction": "BENIGN",
+            "governance": {"action": "allow"},
+        }))
+        self.assertTrue(firewall._is_block_candidate({
+            "prediction": "BENIGN",
+            "governance": {"action": "block"},
+        }))
+        self.assertTrue(firewall._is_block_candidate({"prediction": "MALICIOUS", "score": 0.0}))
 
     def test_request_identity_is_retry_stable_and_content_sensitive(self) -> None:
         metadata = {"conversationId": "session-1", "toolCallId": "tool-1"}
@@ -1290,9 +1448,9 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("ignore previous instructions", rendered)
         self.assertNotIn("leak secrets", rendered)
 
-    def test_requirements_pin_sdk_060(self) -> None:
+    def test_requirements_pin_sdk_073(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("silmaril-security-sdk==0.6.0", requirements)
+        self.assertIn("silmaril-security-sdk==0.7.3", requirements)
 
     def test_demo_launcher_builds_public_setup_and_playground_urls(self) -> None:
         demo = load_demo_launcher()
