@@ -12,18 +12,21 @@ replacement is applied before any assistant text is delivered.
 
 ## Install
 
-Recommended install from GitHub:
+Release [v0.6.6](https://github.com/Silmaril-Security/HermesFirewallPlugin/releases/tag/v0.6.6)
+is available. For a reproducible installation on macOS/Linux, check out that
+release and use Hermes's existing local `file://` installer:
 
 ```bash
-hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
+git clone --branch v0.6.6 --depth 1 https://github.com/Silmaril-Security/HermesFirewallPlugin.git
+cd HermesFirewallPlugin
+hermes plugins install "file://$(pwd)" --force --enable
 hermes gateway restart
 ```
 
-This source tree prepares plugin version 0.6.6 (`plugin.yaml` and
-`PLUGIN_VERSION` in `firewall.py`). That is release-preparation metadata, not a
-claim that 0.6.6 is published or installed. It requires Hermes 0.23.0 or newer
-and the published Silmaril Security SDK 0.8.2, the version pinned in
-`requirements.txt`, in the same Python environment that runs Hermes:
+Plugin version 0.6.6 requires Hermes 0.23.0 or newer with the capable
+`hold_stream` output-transform path described below, and the published Silmaril
+Security SDK 0.8.2, the version pinned in `requirements.txt`, in the same Python
+environment that runs Hermes:
 
 ```bash
 pip install silmaril-security-sdk==0.8.2
@@ -32,16 +35,14 @@ pip install silmaril-security-sdk==0.8.2
 Copy `.env.example` into your Hermes environment manager or shell profile and
 replace placeholder values there. Do not commit real API keys.
 
-Local development install on macOS/Linux:
+To install current source from GitHub instead:
 
 ```bash
-git clone https://github.com/Silmaril-Security/HermesFirewallPlugin.git
-cd HermesFirewallPlugin
-hermes plugins install "file://$(pwd)" --force --enable
+hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-Local development install on PowerShell:
+Reproducible local install from an existing v0.6.6 checkout on PowerShell:
 
 ```powershell
 $uri = (Get-Item .).FullName.Replace('\', '/')
