@@ -2,11 +2,13 @@
 
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
 with the Silmaril Security SDK. Shadow is silent. Warn adds one bounded warning
-on supported same-turn surfaces. Block vetoes `pre_tool_call` events when the
-model predicts `MALICIOUS` or governance returns `action=block`.
+on supported same-turn surfaces. On Hermes 0.23+, Block vetoes `pre_llm_call`
+before inference and `pre_tool_call` before execution when the model predicts
+`MALICIOUS` or governance returns `action=block`.
 `post_tool_call` is observe-only. `transform_tool_result` and
 `transform_llm_output` replace Block candidates with fixed, content-free text.
-Hooks without an enforcement return leave completed content unchanged.
+Final assistant output is held until `transform_llm_output` completes, so a
+replacement is applied before any assistant text is delivered.
 
 ## Install
 
@@ -17,14 +19,14 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-This source tree prepares plugin version 0.6.5 (`plugin.yaml` and
+This source tree prepares plugin version 0.6.6 (`plugin.yaml` and
 `PLUGIN_VERSION` in `firewall.py`). That is release-preparation metadata, not a
-claim that 0.6.5 is published or installed. It requires the published Silmaril
-Security SDK 0.7.3, the version pinned in `requirements.txt`, in the same Python
-environment that runs Hermes:
+claim that 0.6.6 is published or installed. It requires Hermes 0.23.0 or newer
+and the published Silmaril Security SDK 0.8.2, the version pinned in
+`requirements.txt`, in the same Python environment that runs Hermes:
 
 ```bash
-pip install silmaril-security-sdk==0.7.3
+pip install silmaril-security-sdk==0.8.2
 ```
 
 Copy `.env.example` into your Hermes environment manager or shell profile and
@@ -51,11 +53,11 @@ hermes gateway restart
 
 The plugin registers seven hooks:
 
-- `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`.
+- `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`. Warn returns bounded context. On a host with the native v0.23 veto consumer, Block returns a fixed veto before inference.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the result is a block candidate.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
 - `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block replaces the result before model reuse.
-- `transform_llm_output` classifies the final assistant response with `HookLabel.LLM_OUTPUT` and replaces Block-candidate output before delivery.
+- `transform_llm_output` is registered with `hold_stream=True`, classifies the held final assistant response with `HookLabel.LLM_OUTPUT`, and replaces Block-candidate output before delivery.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
 - `subagent_stop` classifies the child summary with `HookLabel.LLM_OUTPUT` for visibility.
 
@@ -124,6 +126,9 @@ A returned Hermes native veto (`nativeAction=block_returned`) reports
 Warn and transform replacement (`nativeAction=content_replaced`), reports
 `evidenceTruth=plugin_reported`. Neither value claims the downstream
 consequence was independently prevented.
+For `pre_llm_call`, `block_returned` is emitted only when capability detection
+finds both the native block exit reason and the `blocks` consumer parameter.
+It is never inferred from a Hermes version string.
 
 Writes are synchronous, per-event, and atomic, with `0700` directory and `0600`
 file permissions. Evidence failures log only the error type and never change
@@ -154,16 +159,26 @@ file parser, credential service, or fallback that writes secrets into plugin
 state.
 
 Every classifier request carries plugin-owned `metadata.silmaril` with
-`integration` `hermes-firewall`, `version` `0.6.5`, and `provenance`.
+`integration` `hermes-firewall`, `version` `0.6.6`, and `provenance`.
 Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
 UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
 with a warning. On macOS, a successful ComputerName lookup can add
 `device_name`. Classification continues when either value is absent.
 `device_name` is not written into local evidence.
 
+Requests also use the SDK 0.8.2 typed governance fields. Every request sets the
+canonical agent to `hermes`. Model/user boundaries use an `agent` resource with
+id `hermes`; tool-call and tool-response boundaries use a `tool` resource whose
+id is the trusted native `tool_name`. Hermes 0.23 does not provide a trusted MCP
+server identity to these hooks, so an encoded tool name is not reinterpreted as
+an MCP server. Metadata remains attribution and is not used as a substitute for
+the typed resource.
+
 ## Enforcement
 
-`pre_tool_call` is the pre-execution veto. In Block mode a block candidate
+`pre_llm_call` is the pre-inference veto on Hermes 0.23+. In Block mode a block
+candidate returns fixed, content-free text. `pre_tool_call` is the
+pre-execution veto. In Block mode a block candidate
 returns `{"action": "block", "message": "..."}`. `post_tool_call` is
 observe-only and returns `None` in every mode, including Block.
 `transform_tool_result` and `transform_llm_output` are the native replacement
@@ -182,9 +197,42 @@ same normal hook path used for parent sessions.
 Supported local modes are exactly `shadow`, `warn`, and `block`. By default,
 neither mode variable is set. Current classify responses omit mode, so the
 plugin falls back to Shadow. Select Warn or Block explicitly when intended.
-Warn uses only the existing same-turn warning-context surfaces. Block uses only
-the existing native pre-tool veto and transform replacements. Observe-only
-hooks remain observe-only in every mode.
+Warn uses only the existing same-turn warning-context surfaces. Block uses the
+native prompt/tool vetoes and transform replacements. Observe-only hooks remain
+observe-only in every mode.
+
+While this plugin is enabled on the supported API, assistant streaming is
+buffered in every mode, including Shadow and Warn. Benign, Shadow, Warn, and
+classifier-error paths return the original final content unchanged; buffering
+ensures a Block replacement is selected before any original assistant token is
+delivered. Classification errors remain fail open.
+
+The manifest requires Hermes `>=0.23.0`. If the module is imported directly by
+an older host that bypasses the manifest gate, it safely falls back to
+observation for `pre_llm_call`, registers the old output-transform API without
+claiming held streaming, and does not emit prompt-veto `block_returned`
+evidence. Older hosts therefore cannot guarantee pre-inference prompt vetoes or
+pre-delivery final-output replacement.
+
+Native qualification is pinned to the official Hermes v0.23.0 source commit
+`2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`. The opt-in test executes this
+plugin through that checkout's real plugin manager, conversation loop, stream
+delivery, and finalizer with loopback-only model traffic:
+
+```bash
+HERMES_023_SOURCE=/path/to/hermes-agent-v0.23.0 \
+  python -m unittest -v tests.test_hermes_023_native
+```
+
+The qualification rejects a different revision, any tracked or untracked
+checkout changes, and any imported Hermes consumer module whose origin is
+outside that checkout. It clears the inherited environment before importing
+Hermes, uses isolated `HOME`, `HERMES_HOME`, and temporary directories, and
+allows only loopback model traffic during the cases. This qualification is
+separate from the default unit command, which explicitly reports eight skipped
+native cases when `HERMES_023_SOURCE` is unset; skipped cases are not a native
+qualification result. GitHub CI supplies the pinned source and requires all
+eight cases to run.
 
 To enable enforcement at supported boundaries:
 
@@ -199,10 +247,11 @@ veto shape with readable copy:
 Silmaril Firewall blocked this tool call: Unsafe agent control attempt. Continue without using the blocked content.
 ```
 
-Malicious Block decisions at the transform hooks use the same fixed shape.
-For a `control_abuse` or `prompt_injection` result the replacements are:
+Malicious Block decisions use the same fixed shape. For a `control_abuse` or
+`prompt_injection` result, prompt and transform outputs are:
 
 ```text
+Silmaril Firewall blocked this user prompt: Unsafe agent control attempt. Continue without using the blocked content.
 Silmaril Firewall blocked this tool result: Unsafe agent control attempt. Continue without using the blocked content.
 Silmaril Firewall blocked this assistant output: Unsafe agent control attempt. Continue without using the blocked content.
 ```
@@ -236,10 +285,48 @@ The JSON status output includes the configured API URL and a boolean
 
 ## Development
 
+The default suite requires only the runtime dependency and remains runnable
+with the standard library test runner in a clean environment:
+
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
-python -m py_compile firewall.py __init__.py
-python -m py_compile scripts/open_playground.py
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+```
+
+Install the pinned development tools for pytest and focused lint:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q tests
+.venv/bin/ruff check --select E4,E7,E9,F firewall.py local_evidence.py scripts tests
+```
+
+Native Hermes qualification has a separate pinned dependency set and source
+checkout. Its host-runtime pins mirror the corresponding v0.23.0 upstream
+direct pins used by this focused harness:
+
+```bash
+HERMES_COMMIT=2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+HERMES_SOURCE=/tmp/hermes-agent-v0.23.0
+git init "$HERMES_SOURCE"
+git -C "$HERMES_SOURCE" remote add origin https://github.com/NousResearch/hermes-agent.git
+git -C "$HERMES_SOURCE" fetch --depth=1 origin "$HERMES_COMMIT"
+git -C "$HERMES_SOURCE" checkout --detach "$HERMES_COMMIT"
+python -m venv .venv-native
+.venv-native/bin/python -m pip install -r requirements-native.txt
+HERMES_023_SOURCE="$HERMES_SOURCE" \
+  .venv-native/bin/python -m unittest -v tests.test_hermes_023_native
+```
+
+A qualifying run executes exactly eight tests. It makes no paid inference
+calls and does not install or configure Hermes in the user's profile.
+
+Additional syntax checks:
+
+```bash
+.venv/bin/python -m py_compile firewall.py local_evidence.py __init__.py
+.venv/bin/python -m py_compile scripts/open_playground.py tests/test_hermes_023_native.py
 ```
 
 ## Manage
