@@ -48,6 +48,19 @@ class FakeHookLabel:
 
 
 @dataclass(frozen=True)
+class FakeGovernanceResource:
+    kind: str
+    id: str
+    parent_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FakeGovernanceContext:
+    agent: str
+    resource: FakeGovernanceResource
+
+
+@dataclass(frozen=True)
 class FakeGovernanceDecision:
     action: str
     policy_version: str = "synthetic-policy-v1"
@@ -99,7 +112,34 @@ class FakeFirewall:
         return result
 
 
-class FakeContext:
+class CurrentHostContext:
+    def __init__(self) -> None:
+        self.registered: list[tuple[str, Any, bool]] = []
+
+    def register_hook(
+        self,
+        name: str,
+        callback: Any,
+        *,
+        hold_stream: bool = False,
+    ) -> None:
+        self.registered.append((name, callback, hold_stream))
+
+    def deliver_stream(self, chunks: list[str], **kwargs: Any) -> list[str]:
+        name, callback, hold_stream = next(
+            item for item in self.registered
+            if item[0] == "transform_llm_output"
+        )
+        assert name == "transform_llm_output"
+        original = "".join(chunks)
+        delivered = [] if hold_stream else list(chunks)
+        transformed = callback(response_text=original, **kwargs)
+        if hold_stream or transformed != original:
+            delivered.append(transformed)
+        return delivered
+
+
+class OldHostContext:
     def __init__(self) -> None:
         self.registered: list[tuple[str, Any]] = []
 
@@ -112,9 +152,39 @@ def install_fake_sdk() -> None:
     sdk = types.ModuleType("silmaril_security.sdk")
     sdk.Firewall = FakeFirewall
     sdk.FirewallBlockedException = FakeFirewallBlockedException
+    sdk.GovernanceContext = FakeGovernanceContext
+    sdk.GovernanceResource = FakeGovernanceResource
     sdk.HookLabel = FakeHookLabel
     sys.modules["silmaril_security"] = package
     sys.modules["silmaril_security.sdk"] = sdk
+
+
+@contextlib.contextmanager
+def native_prompt_veto_capability(*, supported: bool = True) -> Any:
+    package = types.ModuleType("agent")
+    package.__path__ = []  # type: ignore[attr-defined]
+    turn_context = types.ModuleType("agent.turn_context")
+    if supported:
+        turn_context.PRE_LLM_BLOCK_EXIT_REASON = (
+            firewall.PRE_LLM_BLOCK_EXIT_REASON
+        )
+
+        def collect(*_args: Any, blocks: list[str] | None = None, **_kwargs: Any) -> str:
+            del blocks
+            return ""
+    else:
+        turn_context.PRE_LLM_BLOCK_EXIT_REASON = "legacy"
+
+        def collect(*_args: Any, **_kwargs: Any) -> str:
+            return ""
+
+    turn_context._collect_pre_llm_call_context = collect
+    package.turn_context = turn_context
+    with mock.patch.dict(
+        sys.modules,
+        {"agent": package, "agent.turn_context": turn_context},
+    ):
+        yield
 
 
 def reset_state(**env: str) -> None:
@@ -160,13 +230,45 @@ class HermesFirewallTests(unittest.TestCase):
         FakeFirewall.calls = []
         FakeFirewall.next_result = FakeResult()
         FakeFirewall.error = None
+        if getattr(sys.modules.get("silmaril_security.sdk"), "Firewall", None) is FakeFirewall:
+            sys.modules.pop("silmaril_security.sdk", None)
+            sys.modules.pop("silmaril_security", None)
         for directory in TEST_EVIDENCE_DIRECTORIES:
             shutil.rmtree(directory, ignore_errors=True)
         TEST_EVIDENCE_DIRECTORIES.clear()
 
-    def test_registers_all_supported_pass_through_hooks(self) -> None:
+    def test_registers_current_host_hooks_with_held_final_output(self) -> None:
         reset_state()
-        ctx = FakeContext()
+        ctx = CurrentHostContext()
+
+        firewall.register(ctx)
+
+        self.assertEqual(
+            [name for name, _, _ in ctx.registered],
+            [
+                "pre_llm_call",
+                "pre_tool_call",
+                "post_tool_call",
+                "transform_tool_result",
+                "transform_llm_output",
+                "subagent_start",
+                "subagent_stop",
+            ],
+        )
+        registrations = {
+            name: hold_stream
+            for name, _, hold_stream in ctx.registered
+        }
+        self.assertTrue(registrations["transform_llm_output"])
+        self.assertFalse(registrations["pre_llm_call"])
+        self.assertEqual(
+            firewall.pre_tool_call.__annotations__["return"],
+            "dict[str, str] | None",
+        )
+
+    def test_registers_old_host_without_claiming_held_stream(self) -> None:
+        reset_state()
+        ctx = OldHostContext()
 
         firewall.register(ctx)
 
@@ -181,10 +283,6 @@ class HermesFirewallTests(unittest.TestCase):
                 "subagent_start",
                 "subagent_stop",
             ],
-        )
-        self.assertEqual(
-            firewall.pre_tool_call.__annotations__["return"],
-            "dict[str, str] | None",
         )
 
     def test_missing_config_fails_open_without_sdk_call(self) -> None:
@@ -274,7 +372,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.5")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.6")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -282,6 +380,20 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertRegex(
             FakeFirewall.calls[1]["options"]["request_id"],
             r"^hermes-firewall-[a-f0-9]{64}$",
+        )
+        self.assertEqual(
+            FakeFirewall.calls[0]["options"]["governance"],
+            FakeGovernanceContext(
+                agent="hermes",
+                resource=FakeGovernanceResource(kind="agent", id="hermes"),
+            ),
+        )
+        self.assertEqual(
+            FakeFirewall.calls[1]["options"]["governance"],
+            FakeGovernanceContext(
+                agent="hermes",
+                resource=FakeGovernanceResource(kind="tool", id="terminal"),
+            ),
         )
         llm_output_metadata = FakeFirewall.calls[4]["options"]["metadata"]
         self.assertEqual(llm_output_metadata["hermesHookEvent"], "transform_llm_output")
@@ -292,6 +404,28 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(subagent_metadata["conversationId"], "child1")
         self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
         self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
+
+    def test_tool_name_does_not_invent_mcp_server_identity(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="mcp__synthetic_server__synthetic_tool",
+                args={},
+            )
+        )
+
+        governance = FakeFirewall.calls[0]["options"]["governance"]
+        self.assertEqual(governance.agent, "hermes")
+        self.assertEqual(governance.resource.kind, "tool")
+        self.assertEqual(
+            governance.resource.id,
+            "mcp__synthetic_server__synthetic_tool",
+        )
+        self.assertIsNone(governance.resource.parent_id)
 
     def test_pre_llm_call_ignores_conversation_history(self) -> None:
         reset_state(
@@ -317,6 +451,104 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("history_len", metadata)
         self.assertNotIn("conversation_history", metadata)
 
+    def test_prompt_veto_capability_requires_consumer_constant_and_blocks_parameter(self) -> None:
+        with native_prompt_veto_capability():
+            self.assertTrue(firewall._supports_native_pre_llm_veto())
+        with native_prompt_veto_capability(supported=False):
+            self.assertFalse(firewall._supports_native_pre_llm_veto())
+
+    def test_native_prompt_veto_blocks_malicious_and_governance_before_inference(self) -> None:
+        cases = (
+            FakeResult(
+                prediction="MALICIOUS",
+                score=0.99,
+                primary_outcome="control_abuse",
+            ),
+            FakeResult(
+                prediction="BENIGN",
+                primary_outcome="benign",
+                governance=FakeGovernanceDecision("block"),
+            ),
+        )
+        for result in cases:
+            with self.subTest(result=result):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE="block",
+                )
+                FakeFirewall.next_result = result
+                evidence: list[dict[str, Any]] = []
+                inference_calls = 0
+
+                def run_turn() -> str:
+                    nonlocal inference_calls
+                    decision = firewall.pre_llm_call(
+                        user_message="ORIGINAL-MALICIOUS-PROMPT",
+                        session_id="session-1",
+                    )
+                    if (
+                        isinstance(decision, dict)
+                        and decision.get("action") == "block"
+                    ):
+                        return decision["message"]
+                    inference_calls += 1
+                    return "model output"
+
+                with (
+                    native_prompt_veto_capability(),
+                    mock.patch.object(
+                        firewall,
+                        "_LOCAL_EVIDENCE_EMITTER",
+                        side_effect=evidence.append,
+                    ),
+                ):
+                    delivered = run_turn()
+
+                self.assertEqual(inference_calls, 0)
+                self.assertIn(
+                    "Silmaril Firewall blocked this user prompt:",
+                    delivered,
+                )
+                self.assertNotIn("ORIGINAL-MALICIOUS-PROMPT", delivered)
+                self.assertEqual(evidence[0]["policyDecision"], "block")
+                self.assertEqual(evidence[0]["nativeAction"], "block_returned")
+                self.assertEqual(
+                    evidence[0]["evidenceTruth"],
+                    "native_response_returned",
+                )
+
+    def test_old_host_prompt_block_is_observational_and_evidence_is_unavailable(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+
+        with (
+            native_prompt_veto_capability(supported=False),
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+        ):
+            decision = firewall.pre_llm_call(
+                user_message="ORIGINAL-MALICIOUS-PROMPT"
+            )
+
+        self.assertIsNone(decision)
+        self.assertEqual(evidence[0]["policyDecision"], "monitor")
+        self.assertEqual(evidence[0]["nativeAction"], "unavailable")
+        self.assertTrue(evidence[0]["blockUnavailable"])
+        self.assertEqual(evidence[0]["evidenceTruth"], "plugin_reported")
+
     def test_endpoint_provenance_is_canonical_and_plugin_owned(self) -> None:
         endpoint_id = "2b64e603-f82a-4aec-9524-9736472dc80a"
         reset_state(SILMARIL_ENDPOINT_ID=endpoint_id)
@@ -331,7 +563,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.5",
+                "version": "0.6.6",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
@@ -807,6 +1039,85 @@ class HermesFirewallTests(unittest.TestCase):
             "Silmaril Firewall blocked this assistant output: Unsafe agent control attempt. Continue without using the blocked content.",
         )
         self.assertNotIn(raw_llm_output, llm_result)
+
+    def test_held_stream_delivers_only_fixed_replacement_for_block_candidates(self) -> None:
+        cases = (
+            FakeResult(
+                prediction="MALICIOUS",
+                score=0.99,
+                primary_outcome="control_abuse",
+            ),
+            FakeResult(
+                prediction="BENIGN",
+                primary_outcome="benign",
+                governance=FakeGovernanceDecision("block"),
+            ),
+        )
+        for result in cases:
+            with self.subTest(result=result):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE="block",
+                )
+                FakeFirewall.next_result = result
+                ctx = CurrentHostContext()
+                firewall.register(ctx)
+
+                delivered = ctx.deliver_stream(
+                    ["ORIGINAL-", "MALICIOUS-", "TOKEN"],
+                    session_id="session-1",
+                    task_id="task-1",
+                )
+
+                self.assertEqual(len(delivered), 1)
+                self.assertIn(
+                    "Silmaril Firewall blocked this assistant output:",
+                    delivered[0],
+                )
+                self.assertNotIn("ORIGINAL-MALICIOUS-TOKEN", delivered[0])
+
+    def test_held_stream_preserves_benign_shadow_warn_and_fail_open_content(self) -> None:
+        cases = (
+            ("block", FakeResult(), None),
+            (
+                "shadow",
+                FakeResult(
+                    prediction="MALICIOUS",
+                    score=0.99,
+                    primary_outcome="control_abuse",
+                ),
+                None,
+            ),
+            (
+                "warn",
+                FakeResult(
+                    prediction="MALICIOUS",
+                    score=0.99,
+                    primary_outcome="control_abuse",
+                ),
+                None,
+            ),
+            ("block", FakeResult(), TimeoutError("classifier unavailable")),
+        )
+        for mode, result, error in cases:
+            with self.subTest(mode=mode, error=error):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE=mode,
+                )
+                FakeFirewall.next_result = result
+                FakeFirewall.error = error
+                ctx = CurrentHostContext()
+                firewall.register(ctx)
+
+                delivered = ctx.deliver_stream(
+                    ["unchanged ", "final output"],
+                    session_id="session-1",
+                )
+
+                self.assertEqual(delivered, ["unchanged final output"])
 
     def test_warn_surfaces_bounded_context_only_at_supported_same_turn_boundaries(self) -> None:
         reset_state(
@@ -1448,9 +1759,36 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("ignore previous instructions", rendered)
         self.assertNotIn("leak secrets", rendered)
 
-    def test_requirements_pin_sdk_073(self) -> None:
+    def test_requirements_pin_sdk_082(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("silmaril-security-sdk==0.7.3", requirements)
+        self.assertIn("silmaril-security-sdk==0.8.2", requirements)
+
+    def test_reproducible_native_qa_dependencies_and_ci_are_pinned(self) -> None:
+        development = Path("requirements-dev.txt").read_text(encoding="utf-8")
+        native = Path("requirements-native.txt").read_text(encoding="utf-8")
+        native_test = Path("tests/test_hermes_023_native.py").read_text(
+            encoding="utf-8"
+        )
+        workflow = Path(".github/workflows/qualification.yml").read_text(
+            encoding="utf-8"
+        )
+        hermes_commit = "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19"
+
+        self.assertIn("pytest==9.2.0", development)
+        self.assertIn("ruff==0.17.4", development)
+        for requirement in (
+            "httpx[socks]==0.28.1",
+            "openai==2.54.0",
+            "psutil==7.2.2",
+            "python-dotenv==1.2.4",
+            "ruamel.yaml==0.18.16",
+        ):
+            self.assertIn(requirement, native)
+        self.assertNotIn("import pytest", native_test)
+        self.assertIn(hermes_commit, workflow)
+        self.assertIn("python -m unittest -v tests.test_hermes_023_native", workflow)
+        self.assertIn("status --porcelain=v1 --untracked-files=all", workflow)
+        self.assertIn(hermes_commit, native_test)
 
     def test_demo_launcher_builds_public_setup_and_playground_urls(self) -> None:
         demo = load_demo_launcher()
@@ -1510,6 +1848,7 @@ class HermesFirewallTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn("license: Apache-2.0", plugin_yaml)
+        self.assertIn('requires_hermes: ">=0.23.0"', plugin_yaml)
         self.assertIn("Apache-2.0", readme)
         self.assertTrue(Path("LICENSE").is_file())
         self.assertTrue(Path("NOTICE").is_file())

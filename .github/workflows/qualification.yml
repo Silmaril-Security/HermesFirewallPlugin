@@ -1,0 +1,51 @@
+name: Qualification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  default-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime requirements only
+        run: python -m pip install -r requirements.txt
+      - name: Run documented default tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+  hermes-023-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HERMES_COMMIT: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pinned native qualification requirements
+        run: python -m pip install -r requirements-native.txt
+      - name: Check out exact Hermes source
+        run: |
+          git init "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$RUNNER_TEMP/hermes-agent" fetch --depth=1 origin "$HERMES_COMMIT"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout --detach "$HERMES_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)" = "$HERMES_COMMIT"
+          test -z "$(git -C "$RUNNER_TEMP/hermes-agent" status --porcelain=v1 --untracked-files=all)"
+      - name: Run all eight native qualification cases
+        env:
+          HERMES_023_SOURCE: ${{ runner.temp }}/hermes-agent
+        run: python -m unittest -v tests.test_hermes_023_native

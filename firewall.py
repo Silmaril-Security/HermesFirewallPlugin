@@ -12,8 +12,10 @@ Block uses only a genuine native veto.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import importlib
+import inspect
+import json
 import logging
 import os
 import re
@@ -21,8 +23,8 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import Callable
-from typing import Any, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 try:
     from .local_evidence import (
@@ -38,7 +40,9 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.5"
+PLUGIN_VERSION = "0.6.6"
+CANONICAL_AGENT_ID = "hermes"
+PRE_LLM_BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
 DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
@@ -255,6 +259,22 @@ def _sdk_symbols() -> tuple[Any, Any, Any]:
             "silmaril-security-sdk is not installed or could not be imported"
         ) from exc
     return Firewall, HookLabel, FirewallBlockedException
+
+
+def _governance_context(hook_name: str, tool_name: str | None) -> Any:
+    """Build typed SDK governance from canonical and native hook identities."""
+    try:
+        from silmaril_security.sdk import GovernanceContext, GovernanceResource
+    except Exception as exc:
+        raise RuntimeError(
+            "silmaril-security-sdk governance types could not be imported"
+        ) from exc
+
+    if hook_name in {"TOOL_CALL", "TOOL_RESPONSE"} and tool_name:
+        resource = GovernanceResource(kind="tool", id=tool_name)
+    else:
+        resource = GovernanceResource(kind="agent", id=CANONICAL_AGENT_ID)
+    return GovernanceContext(agent=CANONICAL_AGENT_ID, resource=resource)
 
 
 def _firewall_client() -> Any:
@@ -521,6 +541,7 @@ def _classify(
             "hook": hook,
             "tool_name": tool_name,
             "metadata": _with_provenance(metadata),
+            "governance": _governance_context(hook_name, tool_name),
         }
         request_id = _stable_request_id(event, metadata or {}, full_text)
         if request_id is not None:
@@ -789,6 +810,35 @@ def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
         "action": "block",
         "message": _block_message(result, "tool call"),
     }
+
+
+def _supports_native_pre_llm_veto() -> bool:
+    """Detect the v0.23 prompt-veto consumer without relying on a version string."""
+    try:
+        turn_context = importlib.import_module("agent.turn_context")
+        collector = turn_context._collect_pre_llm_call_context
+        parameters = inspect.signature(collector).parameters
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+    return (
+        getattr(turn_context, "PRE_LLM_BLOCK_EXIT_REASON", None)
+        == PRE_LLM_BLOCK_EXIT_REASON
+        and "blocks" in parameters
+    )
+
+
+def _supports_hold_stream_registration(register_hook: Callable[..., Any]) -> bool:
+    """Return whether this host exposes the explicit v0.23 hold_stream API."""
+    try:
+        parameter = inspect.signature(register_hook).parameters.get("hold_stream")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
 def pre_llm_call(
     session_id: str = "",
     user_message: str = "",
@@ -814,8 +864,10 @@ def pre_llm_call(
         "USER_INPUT",
         user_message,
     )
+    native_veto_supported = _supports_native_pre_llm_veto()
     mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
         observed,
+        block_action="block_returned" if native_veto_supported else None,
         warn_action="warning_context_returned",
     )
     _record_local_evidence(
@@ -832,6 +884,11 @@ def pre_llm_call(
     )
     if policy_decision == "warn":
         return {"context": WARN_CONTEXT}
+    if policy_decision == "block" and observed is not None:
+        return {
+            "action": "block",
+            "message": _block_message(observed, "user prompt"),
+        }
     return None
 
 
@@ -1127,12 +1184,25 @@ def subagent_stop(
 
 
 def register(ctx: Any) -> None:
-    """Register pass-through firewall hooks with Hermes."""
+    """Register firewall hooks, enabling v0.23 held final-output delivery."""
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("transform_tool_result", transform_tool_result)
-    ctx.register_hook("transform_llm_output", transform_llm_output)
+    hold_stream_supported = _supports_hold_stream_registration(ctx.register_hook)
+    if hold_stream_supported:
+        ctx.register_hook(
+            "transform_llm_output",
+            transform_llm_output,
+            hold_stream=True,
+        )
+    else:
+        ctx.register_hook("transform_llm_output", transform_llm_output)
     ctx.register_hook("subagent_start", subagent_start)
     ctx.register_hook("subagent_stop", subagent_stop)
-    LOGGER.info("[%s] registered pass-through hooks", PLUGIN_NAME)
+    LOGGER.info(
+        "[%s] registered hooks prompt_veto_supported=%s hold_stream_supported=%s",
+        PLUGIN_NAME,
+        _supports_native_pre_llm_veto(),
+        hold_stream_supported,
+    )

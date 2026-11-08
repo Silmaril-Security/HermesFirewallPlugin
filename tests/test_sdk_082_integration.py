@@ -4,7 +4,9 @@ import importlib.metadata
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest import mock
 
@@ -47,6 +49,32 @@ class StandInSession:
         return StandInResponse(self.response)
 
 
+class LoopbackHandler(BaseHTTPRequestHandler):
+    requests: list[dict[str, Any]] = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers["content-length"])
+        payload = json.loads(self.rfile.read(length))
+        self.requests.append(payload)
+        response = json.dumps(
+            {
+                "prediction": "BENIGN",
+                "score": 0.01,
+                "threshold": 0.5,
+                "mode": payload.get("mode"),
+                "primary_outcome": "benign",
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        del args
+
+
 def governance_response(*, response_mode: str = "shadow") -> dict[str, Any]:
     return {
         "prediction": "BENIGN",
@@ -62,7 +90,7 @@ def governance_response(*, response_mode: str = "shadow") -> dict[str, Any]:
     }
 
 
-class PublishedSdk073IntegrationTests(unittest.TestCase):
+class PublishedSdk082IntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.environment = mock.patch.dict(
             os.environ,
@@ -89,10 +117,10 @@ class PublishedSdk073IntegrationTests(unittest.TestCase):
         self.environment.stop()
         self.evidence_directory.cleanup()
 
-    def test_actual_073_parser_raises_typed_governance_block_exception(self) -> None:
+    def test_actual_082_parser_raises_typed_governance_block_exception(self) -> None:
         self.assertEqual(
             importlib.metadata.version("silmaril-security-sdk"),
-            "0.7.3",
+            "0.8.2",
         )
         session = StandInSession(governance_response())
         client = SdkFirewall(
@@ -115,7 +143,7 @@ class PublishedSdk073IntegrationTests(unittest.TestCase):
         self.assertEqual(result.governance.rule_id, "synthetic-rule")
         self.assertEqual(session.requests[0]["mode"], "block")
 
-    def test_plugin_recovers_073_exception_and_local_mode_wins_response_mode(self) -> None:
+    def test_plugin_recovers_082_exception_and_local_mode_wins_response_mode(self) -> None:
         session = StandInSession(governance_response(response_mode="shadow"))
         client = SdkFirewall(
             api_key="synthetic-key",
@@ -150,7 +178,7 @@ class PublishedSdk073IntegrationTests(unittest.TestCase):
         self.assertEqual(evidence[0]["policyDecision"], "block")
         self.assertEqual(evidence[0]["nativeAction"], "block_returned")
 
-    def test_actual_073_transport_error_fails_open(self) -> None:
+    def test_actual_082_transport_error_fails_open(self) -> None:
         session = StandInSession(error=requests.Timeout("synthetic timeout"))
         client = SdkFirewall(
             api_key="synthetic-key",
@@ -175,6 +203,67 @@ class PublishedSdk073IntegrationTests(unittest.TestCase):
                 )
 
         self.assertIsNone(decision)
+
+    def test_plugin_sends_typed_agent_and_ordinary_tool_governance_over_http(self) -> None:
+        LoopbackHandler.requests = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LoopbackHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        os.environ["SILMARIL_API_URL"] = (
+            f"http://127.0.0.1:{server.server_port}/classify"
+        )
+        firewall._SDK_CLIENT = None
+        firewall._SDK_CONFIG = None
+        try:
+            self.assertIsNone(
+                firewall.pre_llm_call(
+                    user_message="synthetic prompt",
+                    session_id="session-1",
+                )
+            )
+            self.assertIsNone(
+                firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": "synthetic command"},
+                    session_id="session-1",
+                    tool_call_id="tool-1",
+                )
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(len(LoopbackHandler.requests), 2)
+        agent_request, tool_request = LoopbackHandler.requests
+        self.assertEqual(
+            agent_request["resource"],
+            {"kind": "agent", "id": "hermes"},
+        )
+        self.assertEqual(
+            agent_request["metadata"]["silmaril"]["governance"],
+            {
+                "agent": "hermes",
+                "resource": {"kind": "agent", "id": "hermes"},
+            },
+        )
+        self.assertEqual(
+            tool_request["resource"],
+            {"kind": "tool", "id": "terminal"},
+        )
+        self.assertEqual(
+            tool_request["metadata"]["silmaril"]["governance"],
+            {
+                "agent": "hermes",
+                "resource": {"kind": "tool", "id": "terminal"},
+            },
+        )
+        self.assertEqual(
+            tool_request["metadata"]["silmaril"]["integration"],
+            "hermes-firewall",
+        )
+        self.assertNotIn("parent_id", tool_request["resource"])
+        self.assertEqual(tool_request["tool_name"], "terminal")
 
 
 if __name__ == "__main__":

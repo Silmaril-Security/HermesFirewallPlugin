@@ -1,6 +1,7 @@
 # Hermes Firewall Installed
 
-This fail-open Silmaril SDK firewall plugin, version 0.6.5, is enabled after Hermes restarts.
+This fail-open Silmaril SDK firewall plugin, version 0.6.6, is enabled after Hermes restarts.
+It requires Hermes 0.23.0 or newer.
 
 It classifies `pre_llm_call`, `pre_tool_call`, `post_tool_call`,
 `transform_tool_result`, `transform_llm_output`, `subagent_start`, and
@@ -27,10 +28,18 @@ outcome was verified. Set `SILMARIL_LOCAL_EVENT_DIR` only when the incoming
 directory must be overridden.
 
 `post_tool_call`, `subagent_start`, and `subagent_stop` are observe-only.
-Block can veto `pre_tool_call`. At `transform_tool_result` and
-`transform_llm_output`, Block replaces malicious tool results and assistant
-output with fixed, content-free text. Warn returns bounded context from
-`pre_llm_call` and appends that warning at `transform_tool_result`.
+Block can veto `pre_llm_call` before inference and `pre_tool_call` before
+execution. At `transform_tool_result` and `transform_llm_output`, Block replaces
+malicious tool results and assistant output with fixed, content-free text.
+Hermes holds assistant streaming until the final transform completes in every
+mode. Warn returns bounded context from `pre_llm_call` and appends that warning
+at `transform_tool_result`.
+
+If this module is directly imported under an older host that bypasses the
+manifest gate, prompt veto remains observational and final-output registration
+falls back to the old unheld API. Such a host cannot guarantee pre-inference
+prompt blocking or pre-delivery replacement, and the plugin does not claim
+those native actions in evidence.
 
 ```bash
 SILMARIL_MODE=block
@@ -39,7 +48,7 @@ SILMARIL_MODE=block
 Install the SDK in the Hermes Python environment:
 
 ```bash
-pip install silmaril-security-sdk==0.7.3
+pip install silmaril-security-sdk==0.8.2
 ```
 
 Set required `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes
