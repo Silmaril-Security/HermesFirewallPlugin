@@ -15,6 +15,7 @@ import functools
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tarfile
@@ -23,9 +24,10 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from email.message import Message
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -74,7 +76,8 @@ TOOL_CALL_DENIAL = "Silmaril Firewall blocked this tool call:"
 TOOL_RESULT_REPLACEMENT = "Silmaril Firewall blocked this tool result:"
 PLUGIN_DEADLINE_MS = firewall.DEFAULT_SDK_TIMEOUT_SECONDS * 1000
 LIVE_TIMEOUT_SECONDS = 10
-HOST_TIMEOUT_SECONDS = 900
+SETTLE_TIMEOUT_SECONDS = 3 * LIVE_TIMEOUT_SECONDS
+HOST_TIMEOUT_SECONDS = 300
 
 Responder = Callable[[Message, dict[str, Any]], "Reply"]
 Fetch = Callable[[str, bytes, Mapping[str, str]], bytes]
@@ -299,15 +302,19 @@ def live_classification(
 
 
 def live_settings(environ: Mapping[str, str]) -> tuple[str, str]:
-    url = environ["CUSTOMER_NATIVE_API_URL"]
+    url = environ.get("CUSTOMER_NATIVE_API_URL", "")
+    api_key = environ.get("CUSTOMER_NATIVE_API_KEY", "")
     if urlsplit(url).scheme != "https":
         raise ValueError("CUSTOMER_NATIVE_API_URL must use https")
-    return url, environ["CUSTOMER_NATIVE_API_KEY"]
+    if not api_key:
+        raise ValueError("CUSTOMER_NATIVE_API_KEY is required")
+    return url, api_key
 
 
 def recording_classifier(
     records: list[dict[str, Any]],
     classify: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    settled: threading.Condition,
     *,
     live: bool,
 ) -> Responder:
@@ -321,29 +328,47 @@ def recording_classifier(
         started = time.monotonic()
         try:
             verdict = classify(payload)
-        except (OSError, ValueError):
-            record.update(decision="error", durationMs=_elapsed_ms(started))
+        except (OSError, ValueError, HTTPException):
+            verdict = None
+        with settled:
+            record.update(
+                _outcome(verdict, live=live),
+                durationMs=round((time.monotonic() - started) * 1000),
+            )
+            settled.notify_all()
+        if verdict is None:
             return Reply(b"{}", status=502)
-        governance = verdict.get("governance") or {}
-        block = (
-            verdict["prediction"] == "MALICIOUS" or governance.get("action") == "block"
-        )
-        record.update(
-            decision="block" if block else "allow", durationMs=_elapsed_ms(started)
-        )
-        if live:
-            record["upstream"] = {
-                "prediction": verdict["prediction"],
-                "mode": verdict.get("mode"),
-                "action": governance.get("action"),
-            }
         return Reply(json.dumps(verdict).encode())
 
     return respond
 
 
-def _elapsed_ms(started: float) -> int:
-    return round((time.monotonic() - started) * 1000)
+def _outcome(verdict: Mapping[str, Any] | None, *, live: bool) -> dict[str, Any]:
+    if verdict is None:
+        return {"decision": "error"}
+    action = (verdict.get("governance") or {}).get("action")
+    block = verdict["prediction"] == "MALICIOUS" or action == "block"
+    upstream = {
+        "prediction": verdict["prediction"],
+        "mode": verdict.get("mode"),
+        "action": action,
+    }
+    return {
+        "decision": "block" if block else "allow",
+        **({"upstream": upstream} if live else {}),
+    }
+
+
+def await_settled(
+    records: Sequence[Mapping[str, Any]],
+    settled: threading.Condition,
+    timeout: float = SETTLE_TIMEOUT_SECONDS,
+) -> None:
+    with settled:
+        if not settled.wait_for(
+            lambda: all("decision" in record for record in records), timeout
+        ):
+            raise TimeoutError("classifier requests are still pending")
 
 
 def live_blocker(scenario_id: str, requests: Sequence[Mapping[str, Any]]) -> str | None:
@@ -354,10 +379,10 @@ def live_blocker(scenario_id: str, requests: Sequence[Mapping[str, Any]]) -> str
     ]
     if not live:
         return None
-    if any(request["decision"] == "error" for request in live):
-        return "classifier_unavailable"
     if any(request["durationMs"] >= PLUGIN_DEADLINE_MS for request in live):
         return "classifier_exceeded_plugin_deadline"
+    if any(request["decision"] == "error" for request in live):
+        return "classifier_unavailable"
     attacks = [
         request
         for request in live
@@ -376,7 +401,7 @@ def evaluate(
     scenario: Scenario,
     *,
     host_exit_code: int,
-    effect_present: bool | None,
+    effect_content: str | None,
     chat_requests: Sequence[Mapping[str, Any]],
     classifier_requests: Sequence[Mapping[str, Any]],
     poison: str,
@@ -401,16 +426,28 @@ def evaluate(
         "model_continued_after_tool": len(turns) >= 2,
         "classifier_reached_through_sdk": bool(classifier_requests)
         and all(request["authenticated"] for request in classifier_requests),
+        "classifier_answered_within_plugin_deadline": all(
+            request["durationMs"] < PLUGIN_DEADLINE_MS
+            for request in classifier_requests
+        ),
         **_scenario_checks(
-            scenario, effect_present, chat_requests, tool_outputs, decisions, poison
+            scenario, effect_content, chat_requests, tool_outputs, decisions, poison
         ),
     }
     passed = all(checks.values())
-    blocker = None if passed else live_blocker(scenario.id, classifier_requests)
+    blocker = (
+        live_blocker(scenario.id, classifier_requests)
+        if checks["host_completed_turn"] and not passed
+        else None
+    )
     return {
         "id": scenario.id,
         "status": "PASS" if passed else "BLOCKED" if blocker else "FAIL",
-        **({} if effect_present is None else {"effect_present": effect_present}),
+        **(
+            {"effect_present": effect_content is not None}
+            if scenario.effect_file
+            else {}
+        ),
         **({"blocker": blocker} if blocker else {}),
         "checks": checks,
     }
@@ -418,7 +455,7 @@ def evaluate(
 
 def _scenario_checks(
     scenario: Scenario,
-    effect_present: bool | None,
+    effect_content: str | None,
     chat_requests: Sequence[Mapping[str, Any]],
     tool_outputs: Sequence[str],
     decisions: Mapping[str, Sequence[str]],
@@ -426,7 +463,8 @@ def _scenario_checks(
 ) -> dict[str, bool]:
     if scenario.id == ALLOW.id:
         return {
-            "effect_file_written": effect_present is True,
+            "effect_file_holds_requested_content": effect_content
+            == scenario.tool_arguments["content"],
             "tool_call_allowed": decisions["tool_call"] == ["allow"],
             "tool_response_allowed": decisions["tool_response"] == ["allow"],
             "tool_output_reached_model": any(
@@ -440,7 +478,7 @@ def _scenario_checks(
         }
     if scenario.id == PRE_TOOL_BLOCK.id:
         return {
-            "effect_file_absent": effect_present is False,
+            "effect_file_absent": effect_content is None,
             "tool_call_blocked": decisions["tool_call"] == ["block"],
             "model_saw_denial": any(
                 TOOL_CALL_DENIAL in output for output in tool_outputs
@@ -566,6 +604,39 @@ def stage_artifact(
     return artifact, sha256
 
 
+def read_effect(workspace: Path, scenario: Scenario) -> str | None:
+    if scenario.effect_file is None:
+        return None
+    effect = workspace / scenario.effect_file
+    return effect.read_text(encoding="utf-8") if effect.is_file() else None
+
+
+def run_contained(
+    command: Sequence[str],
+    *,
+    check: bool = False,
+    timeout: float = HOST_TIMEOUT_SECONDS,
+    **options: Any,
+) -> subprocess.CompletedProcess[str]:
+    with subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+        **options,
+    ) as process:
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+        except BaseException:
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout)
+    if check:
+        completed.check_returncode()
+    return completed
+
+
 def managed_runtime(hermes_home: Path) -> tuple[Path, Path]:
     (facts,) = hermes_home.glob("installs/*/facts.json")
     (uv,) = hermes_home.glob("tools/uv-*/uv")
@@ -606,9 +677,11 @@ def accept(
     provider = scripted_provider(
         chat_requests, functools.partial(scripted_reply, scenarios)
     )
+    settled = threading.Condition()
     recorder = recording_classifier(
         evidence.classifier_requests,
         classify,
+        settled,
         live=evidence.classifier == "live",
     )
     with (
@@ -617,14 +690,11 @@ def accept(
     ):
         environment["SILMARIL_API_URL"] = f"{classifier_url}/classify"
         hermes = functools.partial(
-            subprocess.run,
+            run_contained,
             env=environment,
             cwd=directories["workspace"],
-            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
-            text=True,
-            timeout=HOST_TIMEOUT_SECONDS,
         )
         (directories["hermes"] / "config.yaml").write_text(
             f"{ISOLATED_HOST_CONFIG}"
@@ -660,7 +730,7 @@ def accept(
                 file_digests(artifact), file_digests(installed)
             )
             uv, runtime_python = managed_runtime(directories["hermes"])
-            subprocess.run(
+            run_contained(
                 [
                     str(uv),
                     "pip",
@@ -680,15 +750,12 @@ def accept(
                 turn = hermes(
                     [hermes_bin, "--oneshot", scenario.prompt, "--toolsets", TOOLSET]
                 )
+                await_settled(evidence.classifier_requests, settled)
                 evidence.scenarios.append(
                     evaluate(
                         scenario,
                         host_exit_code=turn.returncode,
-                        effect_present=None
-                        if scenario.effect_file is None
-                        else (
-                            directories["workspace"] / scenario.effect_file
-                        ).is_file(),
+                        effect_content=read_effect(directories["workspace"], scenario),
                         chat_requests=chat_requests[first_chat:],
                         classifier_requests=evidence.classifier_requests[
                             first_classification:

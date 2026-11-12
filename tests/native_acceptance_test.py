@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from pathlib import Path
 from typing import Any
@@ -9,6 +15,14 @@ from typing import Any
 import pytest
 
 from scripts import native_acceptance as native
+
+LIVE_SETTINGS = {
+    "CUSTOMER_NATIVE_API_URL": "https://cascade.test/classify",
+    "CUSTOMER_NATIVE_API_KEY": "live-key",
+}
+ALLOW_TOOL_OUTPUT = json.dumps(
+    {"resolved_path": f"/workspace/{native.ALLOW.effect_file}"}
+)
 
 
 def _headers(api_key: str = native.CLASSIFIER_KEY) -> Message:
@@ -45,13 +59,14 @@ def _evaluate(
     tool_output: str,
     classifier_requests: list[dict[str, Any]],
     *,
-    effect_present: bool | None = None,
+    effect_content: str | None = None,
     poison: str = native.LOOPBACK_POISON,
+    host_exit_code: int = 0,
 ) -> dict[str, Any]:
     return native.evaluate(
         scenario,
-        host_exit_code=0,
-        effect_present=effect_present,
+        host_exit_code=host_exit_code,
+        effect_content=effect_content,
         chat_requests=_turns(scenario, tool_output),
         classifier_requests=classifier_requests,
         poison=poison,
@@ -151,7 +166,7 @@ def test_loopback_classification_blocks_only_marked_hooks(
 def test_recording_classifier_records_loopback_decisions_without_text() -> None:
     records: list[dict[str, Any]] = []
     respond = native.recording_classifier(
-        records, native.loopback_classification, live=False
+        records, native.loopback_classification, threading.Condition(), live=False
     )
 
     reply = respond(
@@ -203,6 +218,7 @@ def test_live_classifier_proxies_with_the_customer_key_and_records_upstream() ->
         functools.partial(
             native.live_classification, fetch, "https://cascade.test", "live-key"
         ),
+        threading.Condition(),
         live=True,
     )
 
@@ -241,6 +257,7 @@ def test_live_classifier_reports_transport_failures_as_bad_gateway(
         functools.partial(
             native.live_classification, fetch, "https://cascade.test", "live-key"
         ),
+        threading.Condition(),
         live=True,
     )
 
@@ -259,6 +276,7 @@ def test_live_classifier_rejects_responses_without_a_prediction() -> None:
             "https://cascade.test",
             "live-key",
         ),
+        threading.Condition(),
         live=True,
     )
 
@@ -266,17 +284,77 @@ def test_live_classifier_rejects_responses_without_a_prediction() -> None:
     assert records[0]["decision"] == "error"
 
 
-def test_live_settings_require_https() -> None:
-    live = {
-        "CUSTOMER_NATIVE_API_URL": "https://cascade.test/classify",
-        "CUSTOMER_NATIVE_API_KEY": "live-key",
-    }
+def test_pending_classifier_requests_settle_before_evaluation() -> None:
+    entered = threading.Event()
+    release = threading.Event()
 
-    assert native.live_settings(live) == ("https://cascade.test/classify", "live-key")
-    with pytest.raises(ValueError, match="https"):
-        native.live_settings(
-            {**live, "CUSTOMER_NATIVE_API_URL": "http://cascade.test/classify"}
+    def classify(payload: dict[str, Any]) -> dict[str, Any]:
+        entered.set()
+        release.wait()
+        return native.loopback_classification(payload)
+
+    records: list[dict[str, Any]] = []
+    settled = threading.Condition()
+    respond = native.recording_classifier(records, classify, settled, live=False)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        reply = pool.submit(
+            respond, _headers(), {"hook": "tool_call", "text": native.RELEASE_SUMMARY}
         )
+        entered.wait()
+        assert "decision" not in records[0]
+        with pytest.raises(TimeoutError):
+            native.await_settled(records, settled, timeout=0.01)
+        release.set()
+        native.await_settled(records, settled)
+
+    assert reply.result().status == 200
+    assert records[0]["decision"] == "allow"
+    assert isinstance(records[0]["durationMs"], int)
+
+
+def test_live_settings_return_the_endpoint_and_key() -> None:
+    assert native.live_settings(LIVE_SETTINGS) == (
+        "https://cascade.test/classify",
+        "live-key",
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"CUSTOMER_NATIVE_API_URL": "http://cascade.test/classify"}, "https"),
+        ({"CUSTOMER_NATIVE_API_URL": ""}, "https"),
+        ({"CUSTOMER_NATIVE_API_KEY": ""}, "CUSTOMER_NATIVE_API_KEY"),
+    ],
+)
+def test_live_settings_reject_insecure_or_missing_values(
+    override: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        native.live_settings({**LIVE_SETTINGS, **override})
+    with pytest.raises(ValueError, match=message):
+        native.live_settings(
+            {key: value for key, value in LIVE_SETTINGS.items() if key not in override}
+        )
+
+
+def test_missing_live_settings_still_write_a_failed_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    receipt_path = tmp_path / "native-acceptance" / "live-receipt.json"
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    monkeypatch.setenv("NATIVE_ACCEPTANCE_RECEIPT", str(receipt_path))
+    monkeypatch.setenv("CUSTOMER_NATIVE_CLASSIFIER", "live")
+    monkeypatch.delenv("CUSTOMER_NATIVE_API_URL", raising=False)
+    monkeypatch.delenv("CUSTOMER_NATIVE_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="CUSTOMER_NATIVE_API_URL"):
+        native.main()
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert (receipt["status"], receipt["classifier"]) == ("FAIL", "live")
+    assert (receipt["error"], receipt["scenarios"]) == ("ValueError", [])
 
 
 @pytest.mark.parametrize(
@@ -287,6 +365,11 @@ def test_live_settings_require_https() -> None:
         (
             native.TOOL_RESPONSE_BLOCK,
             [_upstream("tool_response", "allow", durationMs=native.PLUGIN_DEADLINE_MS)],
+            "classifier_exceeded_plugin_deadline",
+        ),
+        (
+            native.ALLOW,
+            [_classified("tool_call", "error", durationMs=native.PLUGIN_DEADLINE_MS)],
             "classifier_exceeded_plugin_deadline",
         ),
         (
@@ -320,13 +403,92 @@ def test_live_blocker_attributes_classifier_caused_failures(
 def test_allow_passes_when_the_effect_exists_and_output_reaches_the_model() -> None:
     result = _evaluate(
         native.ALLOW,
-        json.dumps({"resolved_path": f"/workspace/{native.ALLOW.effect_file}"}),
+        ALLOW_TOOL_OUTPUT,
         [_classified("tool_call", "allow"), _classified("tool_response", "allow")],
-        effect_present=True,
+        effect_content=native.RELEASE_SUMMARY,
     )
 
     assert (result["status"], result["effect_present"]) == ("PASS", True)
     assert all(result["checks"].values())
+
+
+@pytest.mark.parametrize("effect_content", ["", native.PRE_TOOL_BLOCK_MARKER])
+def test_allow_fails_when_the_effect_file_holds_other_content(
+    effect_content: str,
+) -> None:
+    result = _evaluate(
+        native.ALLOW,
+        ALLOW_TOOL_OUTPUT,
+        [_classified("tool_call", "allow"), _classified("tool_response", "allow")],
+        effect_content=effect_content,
+    )
+
+    assert (result["status"], result["effect_present"]) == ("FAIL", True)
+    assert result["checks"]["effect_file_holds_requested_content"] is False
+
+
+def test_live_allow_is_blocked_when_the_classifier_outlives_the_plugin_deadline() -> (
+    None
+):
+    result = _evaluate(
+        native.ALLOW,
+        ALLOW_TOOL_OUTPUT,
+        [
+            _upstream("tool_call", "allow", durationMs=native.PLUGIN_DEADLINE_MS),
+            _upstream("tool_response", "allow"),
+        ],
+        effect_content=native.RELEASE_SUMMARY,
+    )
+
+    assert (result["status"], result["blocker"]) == (
+        "BLOCKED",
+        "classifier_exceeded_plugin_deadline",
+    )
+    assert result["checks"]["classifier_answered_within_plugin_deadline"] is False
+
+
+def test_live_pass_does_not_depend_on_the_upstream_mode() -> None:
+    records: list[dict[str, Any]] = []
+    respond = native.recording_classifier(
+        records,
+        lambda _payload: {
+            "prediction": "MALICIOUS",
+            "mode": None,
+            "governance": {"action": "allow"},
+        },
+        threading.Condition(),
+        live=True,
+    )
+    respond(_headers(), {"hook": "tool_response", "text": native.LIVE_ATTACK})
+
+    result = _evaluate(
+        native.TOOL_RESPONSE_BLOCK,
+        f"{native.TOOL_RESULT_REPLACEMENT} Unsafe agent control attempt.",
+        records,
+        poison=native.LIVE_ATTACK,
+    )
+
+    assert records[0]["upstream"] == {
+        "prediction": "MALICIOUS",
+        "mode": None,
+        "action": "allow",
+    }
+    assert result["status"] == "PASS"
+    assert "blocker" not in result
+
+
+def test_host_crash_fails_even_when_the_live_classifier_was_slow() -> None:
+    result = _evaluate(
+        native.TOOL_RESPONSE_BLOCK,
+        json.dumps({"content": native.LIVE_ATTACK}),
+        [_upstream("tool_response", "allow", durationMs=native.PLUGIN_DEADLINE_MS)],
+        poison=native.LIVE_ATTACK,
+        host_exit_code=1,
+    )
+
+    assert result["status"] == "FAIL"
+    assert "blocker" not in result
+    assert result["checks"]["host_completed_turn"] is False
 
 
 def test_allow_fails_when_the_tool_was_denied() -> None:
@@ -334,11 +496,10 @@ def test_allow_fails_when_the_tool_was_denied() -> None:
         native.ALLOW,
         f"{native.TOOL_CALL_DENIAL} Unsafe content.",
         [_classified("tool_call", "block")],
-        effect_present=False,
     )
 
-    assert result["status"] == "FAIL"
-    assert result["checks"]["effect_file_written"] is False
+    assert (result["status"], result["effect_present"]) == ("FAIL", False)
+    assert result["checks"]["effect_file_holds_requested_content"] is False
     assert result["checks"]["tool_output_reached_model"] is False
 
 
@@ -349,8 +510,13 @@ def test_pre_tool_block_passes_only_when_the_effect_is_absent() -> None:
         _classified("tool_response", "allow"),
     ]
 
-    blocked = _evaluate(native.PRE_TOOL_BLOCK, denial, decisions, effect_present=False)
-    leaked = _evaluate(native.PRE_TOOL_BLOCK, denial, decisions, effect_present=True)
+    blocked = _evaluate(native.PRE_TOOL_BLOCK, denial, decisions)
+    leaked = _evaluate(
+        native.PRE_TOOL_BLOCK,
+        denial,
+        decisions,
+        effect_content=native.PRE_TOOL_BLOCK_MARKER,
+    )
 
     assert (blocked["status"], blocked["effect_present"]) == ("PASS", False)
     assert (leaked["status"], leaked["checks"]["effect_file_absent"]) == ("FAIL", False)
@@ -395,12 +561,12 @@ def test_live_classifier_miss_is_blocked_with_a_named_blocker() -> None:
 def test_unauthenticated_classifier_requests_fail_the_scenario() -> None:
     result = _evaluate(
         native.ALLOW,
-        json.dumps({"resolved_path": native.ALLOW.effect_file}),
+        ALLOW_TOOL_OUTPUT,
         [
             _classified("tool_call", "allow", authenticated=False),
             _classified("tool_response", "allow"),
         ],
-        effect_present=True,
+        effect_content=native.RELEASE_SUMMARY,
     )
 
     assert result["status"] == "FAIL"
@@ -490,3 +656,57 @@ def test_installed_bytes_match_allows_only_host_example_copies() -> None:
     assert not native.installed_bytes_match(
         artifact, {**artifact, ".env": "2", "firewall.py": "tampered"}
     )
+
+
+def test_read_effect_distinguishes_absent_files_from_scenarios_without_effects(
+    tmp_path: Path,
+) -> None:
+    assert native.read_effect(tmp_path, native.ALLOW) is None
+    (tmp_path / str(native.ALLOW.effect_file)).write_text("", encoding="utf-8")
+    (tmp_path / "None").write_text(native.LOOPBACK_POISON, encoding="utf-8")
+
+    assert native.read_effect(tmp_path, native.ALLOW) == ""
+    assert native.read_effect(tmp_path, native.TOOL_RESPONSE_BLOCK) is None
+
+
+def test_run_contained_reports_output_and_failures() -> None:
+    succeeded = native.run_contained(
+        [sys.executable, "-c", "print('ready')"], stdout=subprocess.PIPE
+    )
+
+    assert (succeeded.returncode, succeeded.stdout) == (0, "ready\n")
+    assert (
+        native.run_contained([sys.executable, "-c", "raise SystemExit(4)"]).returncode
+        == 4
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        native.run_contained([sys.executable, "-c", "raise SystemExit(4)"], check=True)
+
+
+def test_run_contained_stops_the_whole_process_tree_on_timeout(tmp_path: Path) -> None:
+    descendant_pid = tmp_path / "descendant.pid"
+    spawn_descendant = (
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        native.run_contained(
+            [sys.executable, "-c", spawn_descendant, str(descendant_pid)], timeout=3
+        )
+
+    pid = int(descendant_pid.read_text())
+    deadline = time.monotonic() + 10
+    while _is_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _is_running(pid)
+
+
+def _is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
