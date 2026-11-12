@@ -14,84 +14,26 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
 import firewall
+from scripts.native_acceptance import (
+    ISOLATED_HOST_CONFIG,
+    loopback_server,
+    scripted_provider,
+)
 
 
 HERMES_023_COMMIT = "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19"
 MALICIOUS_TOKEN = "NATIVE-MALICIOUS-TOKEN"
-
-
-class _Provider(BaseHTTPRequestHandler):
-    chat_requests: list[dict] = []
-
-    def do_POST(self) -> None:
-        request = json.loads(
-            self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
-        )
-        if "messages" in request:
-            type(self).chat_requests.append(request)
-        if request.get("stream") is True:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            chunks = (
-                ({"role": "assistant", "content": MALICIOUS_TOKEN}, None),
-                ({}, "stop"),
-            )
-            for delta, finish_reason in chunks:
-                body = {
-                    "id": "loopback",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": delta,
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                }
-                self.wfile.write(f"data: {json.dumps(body)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            return
-        body = json.dumps(
-            {
-                "id": "loopback",
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 1,
-                    "total_tokens": 11,
-                },
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": MALICIOUS_TOKEN,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, _format: str, *args: object) -> None:
-        del args
 
 
 def _decision(*, malicious: bool = False, governance: bool = False) -> dict:
@@ -149,21 +91,7 @@ class Hermes023NativeQualificationTests(unittest.TestCase):
         tmp_dir = cls.temp_root / "tmp"
         for directory in (home, hermes_home, tmp_dir):
             directory.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "updates:\n"
-            "  check: false\n"
-            "models_dev:\n"
-            "  url: http://127.0.0.1:9/api.json\n"
-            "skills:\n"
-            "  creation_nudge_interval: 0\n"
-            "memory:\n"
-            "  nudge_interval: 0\n"
-            "telemetry:\n"
-            "  shared_metrics:\n"
-            "    enabled: false\n"
-            "    send: false\n",
-            encoding="utf-8",
-        )
+        (hermes_home / "config.yaml").write_text(ISOLATED_HOST_CONFIG, encoding="utf-8")
 
         git = shutil.which("git")
         if git is None:
@@ -261,21 +189,18 @@ class Hermes023NativeQualificationTests(unittest.TestCase):
         )
         firewall.register(context)
 
-        self.server = HTTPServer(("127.0.0.1", 0), _Provider)
-        self.thread = threading.Thread(
-            target=self.server.serve_forever,
-            daemon=True,
+        self.chat_requests: list[dict] = []
+        servers = ExitStack()
+        self.addCleanup(servers.close)
+        provider = scripted_provider(
+            self.chat_requests,
+            lambda _request: {"role": "assistant", "content": MALICIOUS_TOKEN},
         )
-        self.thread.start()
-        _Provider.chat_requests = []
-        self.provider_url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        self.provider_url = f"{servers.enter_context(loopback_server(provider))}/v1"
 
     def tearDown(self) -> None:
         from hermes_cli import plugins
 
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
         plugins._reset_plugin_managers_for_tests()
         os.environ["SILMARIL_MODE"] = "block"
 
@@ -295,7 +220,7 @@ class Hermes023NativeQualificationTests(unittest.TestCase):
                 "synthetic blocked prompt"
             )
 
-        self.assertEqual(_Provider.chat_requests, [])
+        self.assertEqual(self.chat_requests, [])
         self.assertEqual(
             result["turn_exit_reason"],
             firewall.PRE_LLM_BLOCK_EXIT_REASON,
@@ -332,9 +257,9 @@ class Hermes023NativeQualificationTests(unittest.TestCase):
             agent.stream_delta_callback = shown.append
             result = agent.run_conversation("synthetic allowed prompt")
 
-        self.assertTrue(_Provider.chat_requests)
+        self.assertTrue(self.chat_requests)
         self.assertTrue(
-            all(request.get("stream") is True for request in _Provider.chat_requests)
+            all(request.get("stream") is True for request in self.chat_requests)
         )
         self.assertFalse([text for text in shown if text])
         if expect_replaced:
