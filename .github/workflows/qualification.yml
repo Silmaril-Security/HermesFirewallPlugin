@@ -5,6 +5,14 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      live:
+        type: boolean
+        description: Include the dedicated customer Cascade journey
+        default: false
+  schedule:
+    - cron: '23 6 * * *'
 
 concurrency:
   group: validation-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
@@ -15,10 +23,13 @@ permissions:
 
 jobs:
   default-tests:
+    if: github.event_name != 'schedule' || vars.CUSTOMER_NATIVE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.12"
@@ -27,15 +38,23 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run documented default tests
         run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: Install pinned development tools
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check --select E4,E7,E9,F firewall.py local_evidence.py scripts tests
+      - name: Run native acceptance unit tests
+        run: python -m pytest -q tests/native_acceptance_test.py
 
   hermes-023-native:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || vars.CUSTOMER_NATIVE_ENABLED == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       HERMES_COMMIT: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.12"
@@ -54,3 +73,32 @@ jobs:
         env:
           HERMES_023_SOURCE: ${{ runner.temp }}/hermes-agent
         run: python -m unittest -v tests.test_hermes_023_native
+      - name: Build the pinned Hermes CLI from its lockfile
+        run: |
+          read -r url sha256 < <(python -c 'import json, sys; uv = json.load(open(sys.argv[1]))["packages"]["uv"]["artifacts"]["linux-x64"]; print(uv["url"], uv["sha256"])' "$RUNNER_TEMP/hermes-agent/pm/lock.json")
+          curl --fail --location --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/uv.tar.gz" "$url"
+          echo "$sha256  $RUNNER_TEMP/uv.tar.gz" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/uv"
+          tar -xzf "$RUNNER_TEMP/uv.tar.gz" -C "$RUNNER_TEMP/uv" --strip-components=1
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/hermes-venv" "$RUNNER_TEMP/uv/uv" sync --frozen --no-dev --python 3.14 --project "$RUNNER_TEMP/hermes-agent"
+          test "$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)" = "$HERMES_COMMIT"
+          test -z "$(git -C "$RUNNER_TEMP/hermes-agent" status --porcelain=v1 --untracked-files=all)"
+          echo "HERMES_BIN=$RUNNER_TEMP/hermes-venv/bin/hermes" >> "$GITHUB_ENV"
+      - name: Accept the installed plugin in the real Hermes CLI
+        env:
+          NATIVE_ACCEPTANCE_RECEIPT: ${{ runner.temp }}/native-acceptance/receipt.json
+        run: python -m scripts.native_acceptance
+      - name: Accept the installed plugin against customer Cascade
+        if: inputs.live == true || vars.CUSTOMER_NATIVE_ENABLED == 'true'
+        env:
+          NATIVE_ACCEPTANCE_RECEIPT: ${{ runner.temp }}/native-acceptance/live-receipt.json
+          CUSTOMER_NATIVE_CLASSIFIER: live
+          CUSTOMER_NATIVE_API_URL: ${{ vars.CUSTOMER_API_URL }}
+          CUSTOMER_NATIVE_API_KEY: ${{ secrets.CUSTOMER_API_KEY }}
+        run: python -m scripts.native_acceptance
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: native-acceptance
+          path: ${{ runner.temp }}/native-acceptance/
+          retention-days: 7
