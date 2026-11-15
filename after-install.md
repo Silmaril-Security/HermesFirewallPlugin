@@ -1,12 +1,13 @@
 # Hermes Firewall Installed
 
-This fail-open Silmaril SDK firewall plugin, version 0.6.6, is enabled after Hermes restarts.
-It requires Hermes 0.23.0 or newer.
+This fail-open Silmaril SDK firewall plugin, version 0.6.7, is enabled after Hermes restarts.
+It requires Hermes 0.23.1 or newer.
 
-It classifies `pre_llm_call`, `pre_tool_call`, `post_tool_call`,
-`transform_tool_result`, `transform_llm_output`, `subagent_start`, and
-`subagent_stop` with the Silmaril Security SDK. SDK output is logged for each
-call without raw classified text. SDK failures are logged and fail open. A
+It classifies `pre_llm_call`, `pre_auxiliary_call`, `post_auxiliary_call`,
+`pre_tool_call`, `post_tool_call`, `transform_tool_result`,
+`transform_llm_output`, `subagent_start`, and `subagent_stop` with the Silmaril
+Security SDK. SDK output is logged for each call without raw classified text.
+SDK failures are logged and fail open. A
 `FirewallBlockedException` that includes a classification result supplies that
 result for the effective-mode decision and is not treated as an outage. A valid
 `SILMARIL_MODE` wins. The deprecated `HERMES_FIREWALL_BLOCK_MALICIOUS` flag is
@@ -27,7 +28,11 @@ These records contain redacted metadata only and never claim a real-world
 outcome was verified. Set `SILMARIL_LOCAL_EVENT_DIR` only when the incoming
 directory must be overridden.
 
-`post_tool_call`, `subagent_start`, and `subagent_stop` are observe-only.
+`post_tool_call`, `pre_auxiliary_call`, `post_auxiliary_call`,
+`subagent_start`, and `subagent_stop` are observe-only. Auxiliary hooks use
+bounded sanitized request/response surfaces, correlate logical requests and
+attempts, and never claim prevention. Block candidates at those boundaries
+record native action unavailable.
 Block can veto `pre_llm_call` before inference and `pre_tool_call` before
 execution. At `transform_tool_result` and `transform_llm_output`, Block replaces
 malicious tool results and assistant output with fixed, content-free text.

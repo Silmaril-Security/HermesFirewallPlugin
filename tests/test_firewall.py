@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -247,6 +248,8 @@ class HermesFirewallTests(unittest.TestCase):
             [name for name, _, _ in ctx.registered],
             [
                 "pre_llm_call",
+                "pre_auxiliary_call",
+                "post_auxiliary_call",
                 "pre_tool_call",
                 "post_tool_call",
                 "transform_tool_result",
@@ -276,6 +279,8 @@ class HermesFirewallTests(unittest.TestCase):
             [name for name, _ in ctx.registered],
             [
                 "pre_llm_call",
+                "pre_auxiliary_call",
+                "post_auxiliary_call",
                 "pre_tool_call",
                 "post_tool_call",
                 "transform_tool_result",
@@ -372,7 +377,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.6")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.7")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -404,6 +409,374 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(subagent_metadata["conversationId"], "child1")
         self.assertEqual(subagent_metadata["childSubagentId"], "agent1")
         self.assertEqual(subagent_metadata["parentTurnId"], "turn1")
+
+    def test_stable_0231_signatures_expose_conversation_and_auxiliary_fields(self) -> None:
+        for callback in (
+            firewall.pre_tool_call,
+            firewall.post_tool_call,
+            firewall.transform_tool_result,
+        ):
+            parameters = inspect.signature(callback).parameters
+            self.assertIn("session_id", parameters)
+            self.assertIn("conversation_id", parameters)
+            self.assertIn("tool_call_id", parameters)
+            self.assertIn("turn_id", parameters)
+            self.assertIn("api_request_id", parameters)
+            self.assertIn("kwargs", parameters)
+
+        expected_auxiliary = {
+            "aux_task",
+            "task_id",
+            "turn_id",
+            "session_id",
+            "platform",
+            "api_request_id",
+            "api_call_count",
+            "retry_count",
+            "streaming",
+            "model",
+            "provider",
+            "base_url",
+            "api_mode",
+            "request_messages",
+            "system_prompt",
+            "message_count",
+            "tool_count",
+            "approx_input_tokens",
+            "request_char_count",
+            "max_tokens",
+            "started_at",
+            "request",
+            "kwargs",
+        }
+        pre_parameters = set(inspect.signature(firewall.pre_auxiliary_call).parameters)
+        self.assertEqual(pre_parameters, expected_auxiliary)
+        post_parameters = set(inspect.signature(firewall.post_auxiliary_call).parameters)
+        self.assertEqual(post_parameters, expected_auxiliary | {
+            "api_duration",
+            "ended_at",
+            "finish_reason",
+            "response_model",
+            "usage",
+            "response",
+            "assistant_content_chars",
+            "assistant_tool_call_count",
+            "error",
+            "error_type",
+        })
+
+    def test_conversation_identity_survives_session_rotation_with_explicit_fallback(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+        )
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": "true"},
+                session_id="compressed-segment-2",
+                conversation_id="conversation-first-session",
+                tool_call_id="call-1",
+            )
+        )
+        stable = FakeFirewall.calls[-1]["options"]["metadata"]
+        self.assertEqual(stable["conversationId"], "conversation-first-session")
+        self.assertEqual(stable["conversationIdSource"], "conversation_id")
+        self.assertEqual(stable["conversationIdStatus"], "valid")
+        self.assertEqual(stable["sessionId"], "compressed-segment-2")
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": "true"},
+                session_id="child-session",
+                conversation_id="delegator-conversation",
+                tool_call_id="call-2",
+            )
+        )
+        delegated = FakeFirewall.calls[-1]["options"]["metadata"]
+        self.assertEqual(delegated["conversationId"], "delegator-conversation")
+        self.assertEqual(delegated["sessionId"], "child-session")
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": "true"},
+                session_id="fallback-session",
+                conversation_id="invalid\nconversation",
+                tool_call_id="call-3",
+            )
+        )
+        fallback = FakeFirewall.calls[-1]["options"]["metadata"]
+        self.assertEqual(fallback["conversationId"], "fallback-session")
+        self.assertEqual(fallback["conversationIdSource"], "session_id")
+        self.assertEqual(fallback["conversationIdStatus"], "invalid")
+
+        self.assertIsNone(
+            firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": "true"},
+                session_id="missing-fallback",
+                conversation_id="",
+                tool_call_id="call-4",
+            )
+        )
+        missing = FakeFirewall.calls[-1]["options"]["metadata"]
+        self.assertEqual(missing["conversationId"], "missing-fallback")
+        self.assertEqual(missing["conversationIdStatus"], "missing")
+
+    def test_auxiliary_hooks_are_bounded_correlated_observers(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+            HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+        raw_request = "HEAD" + ("x" * 300) + "TAIL"
+        raw_response = "RESPONSE-HEAD" + ("y" * 300) + "RESPONSE-TAIL"
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="INFO") as logs,
+        ):
+            self.assertIsNone(
+                firewall.pre_auxiliary_call(
+                    aux_task="compression",
+                    task_id="task-1",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    platform="cli",
+                    api_request_id="aux-logical-1",
+                    api_call_count=4,
+                    retry_count=1,
+                    streaming=False,
+                    model="test-model",
+                    provider="test-provider",
+                    request_messages=[{"content": "RAW-HISTORY-MUST-NOT-LOG"}],
+                    system_prompt="RAW-SYSTEM-MUST-NOT-LOG",
+                    request={"body": raw_request},
+                )
+            )
+            self.assertIsNone(
+                firewall.post_auxiliary_call(
+                    aux_task="compression",
+                    task_id="task-1",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    platform="cli",
+                    api_request_id="aux-logical-1",
+                    api_call_count=4,
+                    retry_count=1,
+                    streaming=False,
+                    model="test-model",
+                    provider="test-provider",
+                    request={"body": raw_request},
+                    response={"body": raw_response},
+                    finish_reason="stop",
+                )
+            )
+
+        self.assertEqual(
+            [call["options"]["hook"].value for call in FakeFirewall.calls],
+            ["user_input", "llm_output"],
+        )
+        for call in FakeFirewall.calls:
+            self.assertLessEqual(len(call["text"]), 128)
+            metadata = call["options"]["metadata"]
+            self.assertEqual(metadata["apiRequestId"], "aux-logical-1")
+            self.assertEqual(metadata["retryCount"], 1)
+            self.assertEqual(metadata["auxTask"], "compression")
+            self.assertRegex(
+                call["options"]["request_id"],
+                r"^hermes-firewall-[a-f0-9]{64}$",
+            )
+        self.assertNotEqual(
+            FakeFirewall.calls[0]["options"]["request_id"],
+            FakeFirewall.calls[1]["options"]["request_id"],
+        )
+        self.assertEqual(len(evidence), 2)
+        self.assertTrue(all(event["policyDecision"] == "monitor" for event in evidence))
+        self.assertTrue(all(event["nativeAction"] == "unavailable" for event in evidence))
+        self.assertTrue(all(event["blockUnavailable"] for event in evidence))
+        rendered_logs = "\n".join(logs.output)
+        for raw in (
+            raw_request,
+            raw_response,
+            "RAW-HISTORY-MUST-NOT-LOG",
+            "RAW-SYSTEM-MUST-NOT-LOG",
+        ):
+            self.assertNotIn(raw, rendered_logs)
+
+    def test_post_auxiliary_error_submits_only_error_type_and_tracks_retries(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+        secrets = (
+            "raw-provider-error credential=error-secret",
+            "raw-history credential=history-secret",
+            "raw-system-prompt credential=system-secret",
+            "https://user:base-url-secret@provider.example/v1",
+            "Bearer request-secret",
+        )
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="INFO") as logs,
+        ):
+            for retry_count in (1, 2):
+                self.assertIsNone(
+                    firewall.post_auxiliary_call(
+                        aux_task="compression",
+                        task_id="task-error",
+                        turn_id="turn-error",
+                        session_id="session-error",
+                        platform="cli",
+                        api_request_id="aux-error-logical",
+                        api_call_count=7,
+                        retry_count=retry_count,
+                        streaming=False,
+                        model="test-model",
+                        provider="test-provider",
+                        base_url=secrets[3],
+                        request_messages=[{"content": secrets[1]}],
+                        system_prompt=secrets[2],
+                        request={
+                            "authorization": secrets[4],
+                            "endpoint": secrets[3],
+                        },
+                        response=None,
+                        usage={"credential": "usage-secret"},
+                        error=secrets[0],
+                        error_type="AuthenticationError",
+                    )
+                )
+
+        self.assertEqual(
+            [call["text"] for call in FakeFirewall.calls],
+            ['{"error_type": "AuthenticationError"}'] * 2,
+        )
+        self.assertEqual(
+            [call["options"]["metadata"]["retryCount"] for call in FakeFirewall.calls],
+            [1, 2],
+        )
+        self.assertNotEqual(
+            FakeFirewall.calls[0]["options"]["request_id"],
+            FakeFirewall.calls[1]["options"]["request_id"],
+        )
+        self.assertEqual(len(evidence), 2)
+        self.assertNotEqual(
+            evidence[0]["requestFingerprint"],
+            evidence[1]["requestFingerprint"],
+        )
+        self.assertTrue(all(event["policyDecision"] == "monitor" for event in evidence))
+        self.assertTrue(all(event["nativeAction"] == "unavailable" for event in evidence))
+        self.assertTrue(all(event["blockUnavailable"] for event in evidence))
+
+        classifier_payload = json.dumps(FakeFirewall.calls, default=str, sort_keys=True)
+        rendered_logs = "\n".join(logs.output)
+        rendered_evidence = json.dumps(evidence, sort_keys=True)
+        for secret in (*secrets, "usage-secret"):
+            self.assertNotIn(secret, classifier_payload)
+            self.assertNotIn(secret, rendered_logs)
+            self.assertNotIn(secret, rendered_evidence)
+
+    def test_post_auxiliary_streaming_submits_only_content_free_summary(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+        secrets = (
+            "raw-stream-history credential=history-secret",
+            "raw-stream-system credential=system-secret",
+            "https://user:stream-base-url-secret@provider.example/v1",
+            "Bearer stream-request-secret",
+        )
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="INFO") as logs,
+        ):
+            self.assertIsNone(
+                firewall.post_auxiliary_call(
+                    aux_task="title_generation",
+                    task_id="task-stream",
+                    turn_id="turn-stream",
+                    session_id="session-stream",
+                    platform="cli",
+                    api_request_id="aux-stream-logical",
+                    api_call_count=3,
+                    retry_count=0,
+                    streaming=True,
+                    model="test-model",
+                    provider="test-provider",
+                    base_url=secrets[2],
+                    request_messages=[{"content": secrets[0]}],
+                    system_prompt=secrets[1],
+                    request={
+                        "authorization": secrets[3],
+                        "endpoint": secrets[2],
+                    },
+                    response=None,
+                    usage={"credential": "stream-usage-secret"},
+                    error=None,
+                    error_type=None,
+                )
+            )
+
+        self.assertEqual(FakeFirewall.calls[0]["text"], '{"streaming": true}')
+        self.assertEqual(
+            FakeFirewall.calls[0]["options"]["metadata"]["retryCount"],
+            0,
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["policyDecision"], "monitor")
+        self.assertEqual(evidence[0]["nativeAction"], "unavailable")
+        self.assertTrue(evidence[0]["blockUnavailable"])
+
+        classifier_payload = json.dumps(FakeFirewall.calls, default=str, sort_keys=True)
+        rendered_logs = "\n".join(logs.output)
+        rendered_evidence = json.dumps(evidence, sort_keys=True)
+        for secret in (*secrets, "stream-usage-secret"):
+            self.assertNotIn(secret, classifier_payload)
+            self.assertNotIn(secret, rendered_logs)
+            self.assertNotIn(secret, rendered_evidence)
 
     def test_tool_name_does_not_invent_mcp_server_identity(self) -> None:
         reset_state(
@@ -563,7 +936,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.6",
+                "version": "0.6.7",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
@@ -1772,7 +2145,7 @@ class HermesFirewallTests(unittest.TestCase):
         workflow = Path(".github/workflows/qualification.yml").read_text(
             encoding="utf-8"
         )
-        hermes_commit = "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19"
+        hermes_commit = "3b421578588243f920886e6fe79a6faa87ea026e"
 
         self.assertIn("pytest==9.2.0", development)
         self.assertIn("ruff==0.17.4", development)
@@ -1848,7 +2221,7 @@ class HermesFirewallTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn("license: Apache-2.0", plugin_yaml)
-        self.assertIn('requires_hermes: ">=0.23.0"', plugin_yaml)
+        self.assertIn('requires_hermes: ">=0.23.1"', plugin_yaml)
         self.assertIn("Apache-2.0", readme)
         self.assertTrue(Path("LICENSE").is_file())
         self.assertTrue(Path("NOTICE").is_file())
