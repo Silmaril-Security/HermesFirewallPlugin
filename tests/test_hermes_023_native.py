@@ -1,8 +1,8 @@
-"""Qualification against the actual Hermes v0.23.0 host source.
+"""Qualification against the actual Hermes v0.23.1 host source.
 
 Run explicitly with::
 
-    HERMES_023_SOURCE=/path/to/hermes-agent-v0.23.0 \
+    HERMES_023_SOURCE=/path/to/hermes-agent-v0.23.1 \
       python -m unittest -v tests.test_hermes_023_native
 
 The source checkout must be the pinned upstream commit below. The test uses the
@@ -32,7 +32,7 @@ from scripts.native_acceptance import (
 )
 
 
-HERMES_023_COMMIT = "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19"
+HERMES_023_COMMIT = "3b421578588243f920886e6fe79a6faa87ea026e"
 MALICIOUS_TOKEN = "NATIVE-MALICIOUS-TOKEN"
 
 

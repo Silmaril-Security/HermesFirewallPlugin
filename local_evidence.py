@@ -304,6 +304,11 @@ def _attempted_consequence(
 
 
 def _request_identity(event: str, fields: Mapping[str, Any]) -> str | None:
+    api_request_id = _present_string(fields.get("api_request_id"))
+    if event in {"pre_auxiliary_call", "post_auxiliary_call"} and api_request_id:
+        retry_count = fields.get("retry_count")
+        attempt = retry_count if isinstance(retry_count, int) and retry_count >= 0 else "unknown"
+        return f"{event}:api_request_id:{api_request_id}:retry_count:{attempt}"
     for name in (
         "tool_call_id",
         "task_id",
@@ -317,8 +322,10 @@ def _request_identity(event: str, fields: Mapping[str, Any]) -> str | None:
 
 
 def _session_identity(fields: Mapping[str, Any]) -> str | None:
-    return _present_string(fields.get("child_session_id")) or _present_string(
-        fields.get("session_id")
+    return (
+        _present_string(fields.get("conversation_id"))
+        or _present_string(fields.get("child_session_id"))
+        or _present_string(fields.get("session_id"))
     )
 
 

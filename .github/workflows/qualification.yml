@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HERMES_COMMIT: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+      HERMES_COMMIT: 3b421578588243f920886e6fe79a6faa87ea026e
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

@@ -12,18 +12,18 @@ replacement is applied before any assistant text is delivered.
 
 ## Install
 
-Release [v0.6.6](https://github.com/Silmaril-Security/HermesFirewallPlugin/releases/tag/v0.6.6)
-is available. For a reproducible installation on macOS/Linux, check out that
-release and use Hermes's existing local `file://` installer:
+Version `0.6.7` is the prepared source candidate. It is not asserted as
+published. For a reproducible installation after publication, check out that
+exact release and use Hermes's existing local `file://` installer:
 
 ```bash
-git clone --branch v0.6.6 --depth 1 https://github.com/Silmaril-Security/HermesFirewallPlugin.git
+git clone --branch v0.6.7 --depth 1 https://github.com/Silmaril-Security/HermesFirewallPlugin.git
 cd HermesFirewallPlugin
 hermes plugins install "file://$(pwd)" --force --enable
 hermes gateway restart
 ```
 
-Plugin version 0.6.6 requires Hermes 0.23.0 or newer with the capable
+Plugin version 0.6.7 requires Hermes 0.23.1 or newer with the capable
 `hold_stream` output-transform path described below, and the published Silmaril
 Security SDK 0.8.2, the version pinned in `requirements.txt`, in the same Python
 environment that runs Hermes:
@@ -42,7 +42,7 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-Reproducible local install from an existing v0.6.6 checkout on PowerShell:
+Reproducible local install from an existing v0.6.7 checkout on PowerShell:
 
 ```powershell
 $uri = (Get-Item .).FullName.Replace('\', '/')
@@ -52,11 +52,13 @@ hermes gateway restart
 
 ## Behavior
 
-The plugin registers seven hooks:
+The plugin registers nine hooks:
 
 - `pre_llm_call` classifies the user message with `HookLabel.USER_INPUT`. Warn returns bounded context. On a host with the native v0.23 veto consumer, Block returns a fixed veto before inference.
 - `pre_tool_call` classifies the tool name and arguments with `HookLabel.TOOL_CALL`. It returns `None` by default so the call is allowed, or `{"action": "block", "message": "..."}` when the effective mode is Block and the result is a block candidate.
 - `post_tool_call` classifies the tool result with `HookLabel.TOOL_RESPONSE` and remains observe-only.
+- `pre_auxiliary_call` classifies the host-sanitized request for each auxiliary provider attempt with `HookLabel.USER_INPUT`.
+- `post_auxiliary_call` classifies the sanitized response, bounded error type, or content-free streaming outcome with `HookLabel.LLM_OUTPUT`.
 - `transform_tool_result` reuses the matching `post_tool_call` classification. Warn appends bounded context; Block replaces the result before model reuse.
 - `transform_llm_output` is registered with `hold_stream=True`, classifies the held final assistant response with `HookLabel.LLM_OUTPUT`, and replaces Block-candidate output before delivery.
 - `subagent_start` classifies the child goal with `HookLabel.USER_INPUT` for visibility.
@@ -94,7 +96,12 @@ the model prediction `BENIGN`; it is not relabeled as malicious. A successful
 content match, so that pair makes one SDK request. A failed observation is not
 cached. Changed content receives a distinct content-sensitive identity. Child
 lifecycle events use the child session as their conversation identity; other
-events use the normal Hermes session.
+events use the normal Hermes session unless Hermes supplies `conversation_id`
+on a tool boundary. A valid `conversation_id` is preferred there because it
+stays stable across rotating compression and delegated calls; `session_id`
+remains the distinct current transcript or child segment. Missing or invalid
+conversation IDs fall back explicitly to child session, then session identity,
+and metadata records both the source and validation status.
 
 Every SDK submission, including serialized structured tool arguments, is
 strictly limited by `HERMES_FIREWALL_MAX_PAYLOAD_CHARS`. Oversized text samples
@@ -107,6 +114,15 @@ original full event text.
 This sampling omits the middle of oversized content. A result therefore covers
 only the submitted sample and is not proof that the full input was classified.
 Payload overflow does not itself create an enforcement decision.
+
+Auxiliary hooks use the stable Hermes 0.23.1 contract. `api_request_id`
+correlates every physical attempt of one logical auxiliary call and
+`retry_count` distinguishes attempts. The plugin classifies only the
+host-sanitized `request`/`response` surfaces (or bounded content-free error
+metadata), never raw `request_messages`, `system_prompt`, or provider error
+text. Both hooks always return `None`. In Block mode a policy candidate records
+native action `unavailable` and `blockUnavailable=true`; this does not assert
+that Hermes prevented the auxiliary call.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
 label, tool name, tool call id when present, prediction, readable risk category,
@@ -160,7 +176,7 @@ file parser, credential service, or fallback that writes secrets into plugin
 state.
 
 Every classifier request carries plugin-owned `metadata.silmaril` with
-`integration` `hermes-firewall`, `version` `0.6.6`, and `provenance`.
+`integration` `hermes-firewall`, `version` `0.6.7`, and `provenance`.
 Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
 UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
 with a warning. On macOS, a successful ComputerName lookup can add
@@ -177,7 +193,7 @@ the typed resource.
 
 ## Enforcement
 
-`pre_llm_call` is the pre-inference veto on Hermes 0.23+. In Block mode a block
+`pre_llm_call` is the pre-inference veto on Hermes 0.23.1+. In Block mode a block
 candidate returns fixed, content-free text. `pre_tool_call` is the
 pre-execution veto. In Block mode a block candidate
 returns `{"action": "block", "message": "..."}`. `post_tool_call` is
@@ -189,6 +205,8 @@ assistant output with fixed, content-free text. Warn context is returned from
 appends the same warning. `transform_llm_output` returns the original
 assistant text in Warn mode. `subagent_start` and `subagent_stop` remain
 observe-only because those Hermes hooks have no enforcement return channel.
+`pre_auxiliary_call` and `post_auxiliary_call` are also observer-only and never
+claim veto, cancellation, or replacement.
 Unsafe delegation is blocked at the nearest enforceable gate: the
 `delegate_task` tool call (`DELEGATION_TOOL_NAME` in the plugin) is classified
 and vetoed by `pre_tool_call` before the child agent starts. Child agent
@@ -208,20 +226,20 @@ classifier-error paths return the original final content unchanged; buffering
 ensures a Block replacement is selected before any original assistant token is
 delivered. Classification errors remain fail open.
 
-The manifest requires Hermes `>=0.23.0`. If the module is imported directly by
+The manifest requires Hermes `>=0.23.1`. If the module is imported directly by
 an older host that bypasses the manifest gate, it safely falls back to
 observation for `pre_llm_call`, registers the old output-transform API without
 claiming held streaming, and does not emit prompt-veto `block_returned`
 evidence. Older hosts therefore cannot guarantee pre-inference prompt vetoes or
 pre-delivery final-output replacement.
 
-Native qualification is pinned to the official Hermes v0.23.0 source commit
-`2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`. The opt-in test executes this
+Native qualification is pinned to the official Hermes v0.23.1 source commit
+`3b421578588243f920886e6fe79a6faa87ea026e`. The opt-in test executes this
 plugin through that checkout's real plugin manager, conversation loop, stream
 delivery, and finalizer with loopback-only model traffic:
 
 ```bash
-HERMES_023_SOURCE=/path/to/hermes-agent-v0.23.0 \
+HERMES_023_SOURCE=/path/to/hermes-agent-v0.23.1 \
   python -m unittest -v tests.test_hermes_023_native
 ```
 
@@ -304,12 +322,12 @@ Install the pinned development tools for pytest and focused lint:
 ```
 
 Native Hermes qualification has a separate pinned dependency set and source
-checkout. Its host-runtime pins mirror the corresponding v0.23.0 upstream
+checkout. Its host-runtime pins mirror the corresponding v0.23.1 upstream
 direct pins used by this focused harness:
 
 ```bash
-HERMES_COMMIT=2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
-HERMES_SOURCE=/tmp/hermes-agent-v0.23.0
+HERMES_COMMIT=3b421578588243f920886e6fe79a6faa87ea026e
+HERMES_SOURCE=/tmp/hermes-agent-v0.23.1
 git init "$HERMES_SOURCE"
 git -C "$HERMES_SOURCE" remote add origin https://github.com/NousResearch/hermes-agent.git
 git -C "$HERMES_SOURCE" fetch --depth=1 origin "$HERMES_COMMIT"

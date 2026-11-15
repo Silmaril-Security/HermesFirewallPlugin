@@ -40,7 +40,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.6"
+PLUGIN_VERSION = "0.6.7"
 CANONICAL_AGENT_ID = "hermes"
 PRE_LLM_BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
@@ -48,6 +48,8 @@ DEFAULT_SDK_MAX_RETRIES = 0
 DEFAULT_MAX_PAYLOAD_CHARS = 8000
 DEFAULT_MAX_COLLECTION_ITEMS = 50
 PAYLOAD_OMISSION_MARKER = "...[cut]..."
+MAX_STABLE_IDENTITY_CHARS = 512
+STABLE_IDENTITY_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 DELEGATION_TOOL_NAME = "delegate_task"
 WARN_CONTEXT = (
     "Silmaril Firewall warning: potentially unsafe content was detected. "
@@ -366,18 +368,55 @@ def _full_event_text(value: Any) -> str:
     return json.dumps(_json_full(value), ensure_ascii=False, sort_keys=True)
 
 
+def _validated_stable_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if (
+        not normalized
+        or normalized == "-"
+        or len(normalized) > MAX_STABLE_IDENTITY_CHARS
+        or STABLE_IDENTITY_CONTROL_CHARS.search(normalized)
+    ):
+        return None
+    return normalized
+
+
+def _stable_identity_status(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "missing"
+    return "valid" if _validated_stable_identity(value) is not None else "invalid"
+
+
 def _metadata_value(value: Any) -> Any:
-    return None if value in {"", "-"} else value
+    return None if value is None or value == "" or value == "-" else value
+
+
+def _conversation_identity(fields: Mapping[str, Any]) -> tuple[str | None, str]:
+    conversation_id = _validated_stable_identity(fields.get("conversation_id"))
+    if conversation_id is not None:
+        return conversation_id, "conversation_id"
+    child_session_id = _validated_stable_identity(fields.get("child_session_id"))
+    if child_session_id is not None:
+        return child_session_id, "child_session_id"
+    session_id = _validated_stable_identity(fields.get("session_id"))
+    if session_id is not None:
+        return session_id, "session_id"
+    return None, "none"
 
 
 def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
-    session_id = _metadata_value(fields.get("session_id"))
-    child_session_id = _metadata_value(fields.get("child_session_id"))
+    session_id = _validated_stable_identity(fields.get("session_id"))
+    child_session_id = _validated_stable_identity(fields.get("child_session_id"))
+    conversation_id, conversation_id_source = _conversation_identity(fields)
     return _with_provenance({
         "hermesHookEvent": event,
-        "conversationId": child_session_id or session_id,
+        "conversationId": conversation_id,
+        "conversationIdSource": conversation_id_source,
+        "conversationIdStatus": fields.get("conversation_id_status", "not_provided"),
         "sessionId": session_id,
         "taskId": _metadata_value(fields.get("task_id")),
+        "turnId": _metadata_value(fields.get("turn_id")),
         "toolCallId": _metadata_value(fields.get("tool_call_id")),
         "toolName": _metadata_value(fields.get("tool_name")),
         "model": _metadata_value(fields.get("model")),
@@ -386,6 +425,12 @@ def _metadata(event: str, fields: Mapping[str, Any]) -> dict[str, Any]:
         "childSubagentId": _metadata_value(fields.get("child_subagent_id")),
         "childRole": _metadata_value(fields.get("child_role")),
         "parentTurnId": _metadata_value(fields.get("parent_turn_id")),
+        "parentSessionId": _validated_stable_identity(fields.get("parent_session_id")),
+        "auxTask": _metadata_value(fields.get("aux_task")),
+        "apiRequestId": _validated_stable_identity(fields.get("api_request_id")),
+        "apiCallCount": _metadata_value(fields.get("api_call_count")),
+        "retryCount": _metadata_value(fields.get("retry_count")),
+        "streaming": fields.get("streaming") if isinstance(fields.get("streaming"), bool) else None,
     })
 
 
@@ -711,12 +756,18 @@ def _stable_request_id(
     metadata: Mapping[str, Any],
     text: str,
 ) -> str | None:
-    stable_event_id = (
-        metadata.get("toolCallId")
-        or metadata.get("taskId")
-        or metadata.get("parentTurnId")
-        or metadata.get("childSubagentId")
-    )
+    api_request_id = _validated_stable_identity(metadata.get("apiRequestId"))
+    if event in {"pre_auxiliary_call", "post_auxiliary_call"} and api_request_id is not None:
+        retry_count = metadata.get("retryCount")
+        attempt = retry_count if isinstance(retry_count, int) and retry_count >= 0 else "unknown"
+        stable_event_id: Any = f"{api_request_id}:retry:{attempt}"
+    else:
+        stable_event_id = (
+            metadata.get("toolCallId")
+            or metadata.get("taskId")
+            or metadata.get("parentTurnId")
+            or metadata.get("childSubagentId")
+        )
     if not isinstance(stable_event_id, str) or not stable_event_id:
         return None
     content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -737,6 +788,7 @@ def _stable_request_id(
 def _tool_result_cache_key(fields: Mapping[str, Any], result: str) -> str:
     logical_result = json.dumps(
         {
+            "conversationId": fields.get("conversation_id"),
             "sessionId": fields.get("session_id"),
             "taskId": fields.get("task_id"),
             "toolCallId": fields.get("tool_call_id"),
@@ -841,11 +893,15 @@ def _supports_hold_stream_registration(register_hook: Callable[..., Any]) -> boo
 
 def pre_llm_call(
     session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
     user_message: str = "",
     conversation_history: list[Any] | None = None,
     is_first_turn: bool = False,
     model: str = "",
     platform: str = "",
+    parent_session_id: str = "",
+    sender_id: str = "",
     **kwargs: Any,
 ) -> dict[str, str] | None:
     """Observe the current user turn; sequence state belongs to Firewall."""
@@ -853,8 +909,12 @@ def pre_llm_call(
     # or classify it: earlier events already populate the Firewall sequence cache.
     fields = {
         "session_id": session_id or "-",
+        "task_id": task_id or "-",
+        "turn_id": turn_id or "-",
         "platform": platform or "-",
         "model": model or "-",
+        "parent_session_id": parent_session_id or "-",
+        "sender_id_present": bool(sender_id),
         "first_turn": is_first_turn,
         "user_chars": _safe_len(user_message),
     }
@@ -897,7 +957,11 @@ def pre_tool_call(
     args: dict[str, Any] | None = None,
     task_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
     tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, str] | None:
     """Observe a tool call before execution. Return None to allow it.
@@ -906,12 +970,18 @@ def pre_tool_call(
     Because this hook scans every tool call, that delegation path is covered
     here before subagent_start's observer-only visibility hook fires.
     """
+    stable_conversation_id = _validated_stable_identity(conversation_id)
     fields = {
         "session_id": session_id or "-",
+        "conversation_id": stable_conversation_id or "-",
+        "conversation_id_status": _stable_identity_status(conversation_id),
         "task_id": task_id or "-",
         "tool_call_id": tool_call_id or "-",
+        "turn_id": turn_id or "-",
+        "api_request_id": api_request_id or "-",
         "tool_name": tool_name or "-",
         "arg_keys": _keys(args or {}),
+        "middleware_trace_present": middleware_trace is not None,
     }
     structured_payload = {"tool_name": tool_name, "args": args or {}}
     classified_text = _text_for_classification(structured_payload)
@@ -952,17 +1022,33 @@ def post_tool_call(
     result: str = "",
     task_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
     tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
     duration_ms: int | None = None,
+    status: str = "",
+    error_type: str | None = None,
+    error_message: str | None = None,
+    middleware_trace: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> None:
     """Observe a tool result after execution. Return None to pass through."""
+    stable_conversation_id = _validated_stable_identity(conversation_id)
     fields = {
         "session_id": session_id or "-",
+        "conversation_id": stable_conversation_id or "-",
+        "conversation_id_status": _stable_identity_status(conversation_id),
         "task_id": task_id or "-",
         "tool_call_id": tool_call_id or "-",
+        "turn_id": turn_id or "-",
+        "api_request_id": api_request_id or "-",
         "tool_name": tool_name or "-",
         "duration_ms": duration_ms if duration_ms is not None else "-",
+        "status": status or "-",
+        "error_type": error_type or "-",
+        "error_message_present": bool(error_message),
+        "middleware_trace_present": middleware_trace is not None,
         "result_chars": _safe_len(result),
     }
     cache_key = _tool_result_cache_key(fields, result)
@@ -1002,17 +1088,31 @@ def transform_tool_result(
     result: str = "",
     task_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
     tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
     duration_ms: int | None = None,
+    status: str = "",
+    error_type: str | None = None,
+    error_message: str | None = None,
     **kwargs: Any,
 ) -> str:
     """Classify a tool result and replace malicious Block content before reuse."""
+    stable_conversation_id = _validated_stable_identity(conversation_id)
     fields = {
         "session_id": session_id or "-",
+        "conversation_id": stable_conversation_id or "-",
+        "conversation_id_status": _stable_identity_status(conversation_id),
         "task_id": task_id or "-",
         "tool_call_id": tool_call_id or "-",
+        "turn_id": turn_id or "-",
+        "api_request_id": api_request_id or "-",
         "tool_name": tool_name or "-",
         "duration_ms": duration_ms if duration_ms is not None else "-",
+        "status": status or "-",
+        "error_type": error_type or "-",
+        "error_message_present": bool(error_message),
         "result_chars": _safe_len(result),
     }
     cache_key = _tool_result_cache_key(fields, result)
@@ -1095,6 +1195,227 @@ def transform_llm_output(
     if policy_decision == "block" and observed is not None:
         return _block_message(observed, "assistant output")
     return response_text
+
+
+def _auxiliary_fields(
+    *,
+    aux_task: Any,
+    task_id: Any,
+    turn_id: Any,
+    session_id: Any,
+    platform: Any,
+    api_request_id: Any,
+    api_call_count: Any,
+    retry_count: Any,
+    streaming: Any,
+    model: Any,
+    provider: Any,
+) -> dict[str, Any]:
+    stable_api_request_id = _validated_stable_identity(api_request_id)
+    return {
+        "aux_task": _bound_text(str(aux_task), 128) if aux_task else "-",
+        "task_id": task_id or "-",
+        "turn_id": turn_id or "-",
+        "session_id": session_id or "-",
+        "platform": platform or "-",
+        "api_request_id": stable_api_request_id or "-",
+        "api_request_id_status": _stable_identity_status(api_request_id),
+        "api_call_count": api_call_count if isinstance(api_call_count, int) else "-",
+        "retry_count": retry_count if isinstance(retry_count, int) else "-",
+        "streaming": bool(streaming),
+        "model": _bound_text(str(model), 128) if model else "-",
+        "provider": _bound_text(str(provider), 128) if provider else "-",
+    }
+
+
+def pre_auxiliary_call(
+    aux_task: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    session_id: str = "",
+    platform: str = "",
+    api_request_id: str = "",
+    api_call_count: int | None = None,
+    retry_count: int | None = None,
+    streaming: bool = False,
+    model: str = "",
+    provider: str = "",
+    base_url: str = "",
+    api_mode: str = "",
+    request_messages: list[Any] | None = None,
+    system_prompt: str = "",
+    message_count: int | None = None,
+    tool_count: int | None = None,
+    approx_input_tokens: int | None = None,
+    request_char_count: int | None = None,
+    max_tokens: int | None = None,
+    started_at: Any = None,
+    request: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> None:
+    """Observe one auxiliary provider attempt without asserting prevention."""
+    fields = _auxiliary_fields(
+        aux_task=aux_task,
+        task_id=task_id,
+        turn_id=turn_id,
+        session_id=session_id,
+        platform=platform,
+        api_request_id=api_request_id,
+        api_call_count=api_call_count,
+        retry_count=retry_count,
+        streaming=streaming,
+        model=model,
+        provider=provider,
+    )
+    fields.update({
+        "api_mode": _bound_text(api_mode, 64) if api_mode else "-",
+        "base_url_present": bool(base_url),
+        "request_messages_count": _safe_len(request_messages),
+        "system_prompt_chars": _safe_len(system_prompt),
+        "message_count": message_count if isinstance(message_count, int) else "-",
+        "tool_count": tool_count if isinstance(tool_count, int) else "-",
+        "approx_input_tokens": approx_input_tokens if isinstance(approx_input_tokens, int) else "-",
+        "request_char_count": request_char_count if isinstance(request_char_count, int) else "-",
+        "max_tokens": max_tokens if isinstance(max_tokens, int) else "-",
+        "started_at_present": started_at is not None,
+    })
+    structured_payload = request if isinstance(request, Mapping) else {}
+    classified_text = _text_for_classification(structured_payload)
+    original_text = _full_event_text(structured_payload)
+    observed = _observe(
+        "pre_auxiliary_call",
+        fields,
+        "USER_INPUT",
+        classified_text,
+        original_text=original_text,
+    )
+    mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
+        observed,
+    )
+    _record_local_evidence(
+        event="pre_auxiliary_call",
+        hook="user_input",
+        raw_text=original_text,
+        fields=fields,
+        result=observed,
+        mode=mode,
+        policy_decision=policy_decision,
+        native_action=native_action,
+        warn_delivery=warn_delivery,
+        block_unavailable=block_unavailable,
+    )
+    return None
+
+
+def post_auxiliary_call(
+    aux_task: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    session_id: str = "",
+    platform: str = "",
+    api_request_id: str = "",
+    api_call_count: int | None = None,
+    retry_count: int | None = None,
+    streaming: bool = False,
+    model: str = "",
+    provider: str = "",
+    base_url: str = "",
+    api_mode: str = "",
+    request_messages: list[Any] | None = None,
+    system_prompt: str = "",
+    message_count: int | None = None,
+    tool_count: int | None = None,
+    approx_input_tokens: int | None = None,
+    request_char_count: int | None = None,
+    max_tokens: int | None = None,
+    started_at: Any = None,
+    request: Mapping[str, Any] | None = None,
+    api_duration: float | None = None,
+    ended_at: Any = None,
+    finish_reason: str | None = None,
+    response_model: str | None = None,
+    usage: Mapping[str, Any] | None = None,
+    response: Mapping[str, Any] | None = None,
+    assistant_content_chars: int | None = None,
+    assistant_tool_call_count: int | None = None,
+    error: str | None = None,
+    error_type: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Observe one auxiliary response/error without asserting prevention."""
+    fields = _auxiliary_fields(
+        aux_task=aux_task,
+        task_id=task_id,
+        turn_id=turn_id,
+        session_id=session_id,
+        platform=platform,
+        api_request_id=api_request_id,
+        api_call_count=api_call_count,
+        retry_count=retry_count,
+        streaming=streaming,
+        model=model,
+        provider=provider,
+    )
+    fields.update({
+        "api_mode": _bound_text(api_mode, 64) if api_mode else "-",
+        "base_url_present": bool(base_url),
+        "request_messages_count": _safe_len(request_messages),
+        "system_prompt_chars": _safe_len(system_prompt),
+        "message_count": message_count if isinstance(message_count, int) else "-",
+        "tool_count": tool_count if isinstance(tool_count, int) else "-",
+        "approx_input_tokens": approx_input_tokens if isinstance(approx_input_tokens, int) else "-",
+        "request_char_count": request_char_count if isinstance(request_char_count, int) else "-",
+        "max_tokens": max_tokens if isinstance(max_tokens, int) else "-",
+        "started_at_present": started_at is not None,
+        "api_duration": api_duration if isinstance(api_duration, (int, float)) else "-",
+        "ended_at_present": ended_at is not None,
+        "finish_reason": _bound_text(finish_reason, 64) if finish_reason else "-",
+        "response_model": _bound_text(response_model, 128) if response_model else "-",
+        "usage_present": usage is not None,
+        "assistant_content_chars": (
+            assistant_content_chars if isinstance(assistant_content_chars, int) else "-"
+        ),
+        "assistant_tool_call_count": (
+            assistant_tool_call_count if isinstance(assistant_tool_call_count, int) else "-"
+        ),
+        "error_present": bool(error),
+        "error_type": _bound_text(error_type, 128) if error_type else "-",
+    })
+    if isinstance(response, Mapping):
+        structured_payload: Mapping[str, Any] = response
+    elif error_type:
+        structured_payload = {"error_type": _bound_text(error_type, 128)}
+    elif streaming:
+        structured_payload = {"streaming": True}
+    else:
+        structured_payload = {
+            "finish_reason": _bound_text(finish_reason, 64) if finish_reason else "unknown",
+        }
+    classified_text = _text_for_classification(structured_payload)
+    original_text = _full_event_text(structured_payload)
+    observed = _observe(
+        "post_auxiliary_call",
+        fields,
+        "LLM_OUTPUT",
+        classified_text,
+        original_text=original_text,
+    )
+    mode, policy_decision, native_action, warn_delivery, block_unavailable = _local_evidence_decision(
+        observed,
+    )
+    _record_local_evidence(
+        event="post_auxiliary_call",
+        hook="llm_output",
+        raw_text=original_text,
+        fields=fields,
+        result=observed,
+        mode=mode,
+        policy_decision=policy_decision,
+        native_action=native_action,
+        warn_delivery=warn_delivery,
+        block_unavailable=block_unavailable,
+    )
+    return None
 
 
 def subagent_start(
@@ -1186,6 +1507,8 @@ def subagent_stop(
 def register(ctx: Any) -> None:
     """Register firewall hooks, enabling v0.23 held final-output delivery."""
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("pre_auxiliary_call", pre_auxiliary_call)
+    ctx.register_hook("post_auxiliary_call", post_auxiliary_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("transform_tool_result", transform_tool_result)

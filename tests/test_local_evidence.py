@@ -141,6 +141,61 @@ class LocalEvidenceTests(unittest.TestCase):
         )
         self.assertNotIn(marker, serialized)
 
+    def test_stable_conversation_and_auxiliary_attempts_are_opaque_correlations(self) -> None:
+        common = {
+            "event": "pre_auxiliary_call",
+            "hook": "user_input",
+            "mode": "shadow",
+            "raw_text": "bounded request",
+            "classification": {
+                "prediction": "BENIGN",
+                "primary_outcome": "benign",
+            },
+            "policy_decision": "allow",
+            "native_action": "none",
+            "plugin_name": "hermes-firewall",
+            "plugin_version": "0.6.7",
+        }
+        first = local_evidence.build_local_protection_event(
+            **common,
+            fields={
+                "conversation_id": "conversation-first",
+                "session_id": "segment-one",
+                "api_request_id": "aux-logical",
+                "retry_count": 0,
+            },
+        )
+        rotated = local_evidence.build_local_protection_event(
+            **common,
+            fields={
+                "conversation_id": "conversation-first",
+                "session_id": "segment-two",
+                "api_request_id": "aux-logical",
+                "retry_count": 0,
+            },
+        )
+        retry = local_evidence.build_local_protection_event(
+            **common,
+            fields={
+                "conversation_id": "conversation-first",
+                "session_id": "segment-two",
+                "api_request_id": "aux-logical",
+                "retry_count": 1,
+            },
+        )
+
+        self.assertEqual(first["sessionFingerprint"], rotated["sessionFingerprint"])
+        self.assertEqual(first["requestFingerprint"], rotated["requestFingerprint"])
+        self.assertNotEqual(rotated["requestFingerprint"], retry["requestFingerprint"])
+        serialized = json.dumps([first, rotated, retry], sort_keys=True)
+        for raw_id in (
+            "conversation-first",
+            "segment-one",
+            "segment-two",
+            "aux-logical",
+        ):
+            self.assertNotIn(raw_id, serialized)
+
     def test_prediction_scores_and_unknown_consequences_are_conservative(self) -> None:
         event = local_evidence.build_local_protection_event(
             event="transform_llm_output",

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.7 - Source candidate
+
+- Register stable Hermes 0.23.1 `pre_auxiliary_call` and
+  `post_auxiliary_call` observers with bounded sanitized request/response
+  classification and logical-request/per-attempt correlation.
+- Forward validated tool-hook `conversation_id` independently from rotating
+  transcript sessions and child-session identity, with explicit missing or
+  invalid fallback.
+- Keep auxiliary and lifecycle observers pass-through in every mode; Block
+  candidates record native action unavailable without claiming prevention.
+- Raise the host contract floor and source qualification pin to Hermes 0.23.1.
+
+This entry describes source prepared for 0.6.7. It does not assert package or
+GitHub publication, hosted propagation, deployment, or installed uptake.
+
 ## 0.6.6 - Release preparation
 
 - Require Hermes 0.23.0 and use its native `pre_llm_call` block directive to

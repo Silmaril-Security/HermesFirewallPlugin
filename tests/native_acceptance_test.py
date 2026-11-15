@@ -76,7 +76,7 @@ def _evaluate(
 def _evidence(*statuses: tuple[str, str]) -> native.Evidence:
     evidence = native.Evidence(classifier="loopback")
     evidence.plugin.update(artifact_sha256="a" * 64, installed_bytes_match=True)
-    evidence.host["version"] = "0.23.0"
+    evidence.host["version"] = "0.23.1"
     evidence.scenarios.extend(
         {"id": name, "status": status} for name, status in statuses
     )
@@ -612,7 +612,7 @@ def test_receipt_carries_the_central_contract_fields() -> None:
     assert (receipt["status"], receipt["source_sha"]) == ("PASS", "f" * 40)
     assert receipt["classifier"] == "live"
     assert receipt["plugin"]["name"] == "hermes-firewall"
-    assert receipt["host"] == {"name": "hermes", "version": "0.23.0"}
+    assert receipt["host"] == {"name": "hermes", "version": "0.23.1"}
     assert "pre-tool-block scenario" in receipt["exclusions"]
     assert "real classifier APIs" not in receipt["exclusions"]
 
