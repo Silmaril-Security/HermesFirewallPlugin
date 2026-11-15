@@ -619,6 +619,165 @@ class HermesFirewallTests(unittest.TestCase):
         ):
             self.assertNotIn(raw, rendered_logs)
 
+    def test_post_auxiliary_error_submits_only_error_type_and_tracks_retries(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+        secrets = (
+            "raw-provider-error credential=error-secret",
+            "raw-history credential=history-secret",
+            "raw-system-prompt credential=system-secret",
+            "https://user:base-url-secret@provider.example/v1",
+            "Bearer request-secret",
+        )
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="INFO") as logs,
+        ):
+            for retry_count in (1, 2):
+                self.assertIsNone(
+                    firewall.post_auxiliary_call(
+                        aux_task="compression",
+                        task_id="task-error",
+                        turn_id="turn-error",
+                        session_id="session-error",
+                        platform="cli",
+                        api_request_id="aux-error-logical",
+                        api_call_count=7,
+                        retry_count=retry_count,
+                        streaming=False,
+                        model="test-model",
+                        provider="test-provider",
+                        base_url=secrets[3],
+                        request_messages=[{"content": secrets[1]}],
+                        system_prompt=secrets[2],
+                        request={
+                            "authorization": secrets[4],
+                            "endpoint": secrets[3],
+                        },
+                        response=None,
+                        usage={"credential": "usage-secret"},
+                        error=secrets[0],
+                        error_type="AuthenticationError",
+                    )
+                )
+
+        self.assertEqual(
+            [call["text"] for call in FakeFirewall.calls],
+            ['{"error_type": "AuthenticationError"}'] * 2,
+        )
+        self.assertEqual(
+            [call["options"]["metadata"]["retryCount"] for call in FakeFirewall.calls],
+            [1, 2],
+        )
+        self.assertNotEqual(
+            FakeFirewall.calls[0]["options"]["request_id"],
+            FakeFirewall.calls[1]["options"]["request_id"],
+        )
+        self.assertEqual(len(evidence), 2)
+        self.assertNotEqual(
+            evidence[0]["requestFingerprint"],
+            evidence[1]["requestFingerprint"],
+        )
+        self.assertTrue(all(event["policyDecision"] == "monitor" for event in evidence))
+        self.assertTrue(all(event["nativeAction"] == "unavailable" for event in evidence))
+        self.assertTrue(all(event["blockUnavailable"] for event in evidence))
+
+        classifier_payload = json.dumps(FakeFirewall.calls, default=str, sort_keys=True)
+        rendered_logs = "\n".join(logs.output)
+        rendered_evidence = json.dumps(evidence, sort_keys=True)
+        for secret in (*secrets, "usage-secret"):
+            self.assertNotIn(secret, classifier_payload)
+            self.assertNotIn(secret, rendered_logs)
+            self.assertNotIn(secret, rendered_evidence)
+
+    def test_post_auxiliary_streaming_submits_only_content_free_summary(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.next_result = FakeResult(
+            prediction="MALICIOUS",
+            score=0.99,
+            threshold=0.5,
+            primary_outcome="control_abuse",
+        )
+        evidence: list[dict[str, Any]] = []
+        secrets = (
+            "raw-stream-history credential=history-secret",
+            "raw-stream-system credential=system-secret",
+            "https://user:stream-base-url-secret@provider.example/v1",
+            "Bearer stream-request-secret",
+        )
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="INFO") as logs,
+        ):
+            self.assertIsNone(
+                firewall.post_auxiliary_call(
+                    aux_task="title_generation",
+                    task_id="task-stream",
+                    turn_id="turn-stream",
+                    session_id="session-stream",
+                    platform="cli",
+                    api_request_id="aux-stream-logical",
+                    api_call_count=3,
+                    retry_count=0,
+                    streaming=True,
+                    model="test-model",
+                    provider="test-provider",
+                    base_url=secrets[2],
+                    request_messages=[{"content": secrets[0]}],
+                    system_prompt=secrets[1],
+                    request={
+                        "authorization": secrets[3],
+                        "endpoint": secrets[2],
+                    },
+                    response=None,
+                    usage={"credential": "stream-usage-secret"},
+                    error=None,
+                    error_type=None,
+                )
+            )
+
+        self.assertEqual(FakeFirewall.calls[0]["text"], '{"streaming": true}')
+        self.assertEqual(
+            FakeFirewall.calls[0]["options"]["metadata"]["retryCount"],
+            0,
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["policyDecision"], "monitor")
+        self.assertEqual(evidence[0]["nativeAction"], "unavailable")
+        self.assertTrue(evidence[0]["blockUnavailable"])
+
+        classifier_payload = json.dumps(FakeFirewall.calls, default=str, sort_keys=True)
+        rendered_logs = "\n".join(logs.output)
+        rendered_evidence = json.dumps(evidence, sort_keys=True)
+        for secret in (*secrets, "stream-usage-secret"):
+            self.assertNotIn(secret, classifier_payload)
+            self.assertNotIn(secret, rendered_logs)
+            self.assertNotIn(secret, rendered_evidence)
+
     def test_tool_name_does_not_invent_mcp_server_identity(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
