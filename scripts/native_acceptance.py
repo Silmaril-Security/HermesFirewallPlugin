@@ -26,9 +26,8 @@ import tarfile
 import tempfile
 import threading
 import time
-import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from email.message import Message
 from http.client import HTTPException
@@ -272,18 +271,29 @@ def loopback_classification(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
-        return None
+@contextmanager
+def live_classifier(environ: Mapping[str, str]):
+    url, key = live_settings(environ)
+    # The installed SDK reuses a requests.Session. Keep its upstream relay pooled too.
+    import requests
 
+    with requests.Session() as session:
 
-def https_fetch(url: str, body: bytes, headers: Mapping[str, str]) -> bytes:
-    request = urllib.request.Request(
-        url, data=body, headers=dict(headers), method="POST"
-    )
-    opener = urllib.request.build_opener(_RefuseRedirects)
-    with opener.open(request, timeout=LIVE_TIMEOUT_SECONDS) as response:
-        return response.read()
+        def fetch(endpoint: str, body: bytes, headers: Mapping[str, str]) -> bytes:
+            with session.post(
+                endpoint,
+                data=body,
+                headers=headers,
+                allow_redirects=False,
+                timeout=LIVE_TIMEOUT_SECONDS,
+            ) as response:
+                if not 200 <= response.status_code < 300:
+                    raise ValueError(
+                        f"Unexpected classifier HTTP status {response.status_code}"
+                    )
+                return response.content
+
+        yield functools.partial(live_classification, fetch, url, key)
 
 
 def live_classification(
@@ -452,6 +462,15 @@ def evaluate(
             else {}
         ),
         **({"blocker": blocker} if blocker else {}),
+        **(
+            {
+                "slowest_classifier_ms": max(
+                    request["durationMs"] for request in classifier_requests
+                )
+            }
+            if any("upstream" in request for request in classifier_requests)
+            else {}
+        ),
         "checks": checks,
     }
 
@@ -798,14 +817,14 @@ def main() -> int:
     scenarios = LIVE_SCENARIOS if live else LOOPBACK_SCENARIOS
     evidence = Evidence(classifier="live" if live else "loopback")
     try:
-        classify = (
-            functools.partial(
-                live_classification, https_fetch, *live_settings(os.environ)
-            )
-            if live
-            else loopback_classification
-        )
-        with tempfile.TemporaryDirectory(prefix="hermes-native-acceptance-") as root:
+        with (
+            (
+                live_classifier(os.environ)
+                if live
+                else nullcontext(loopback_classification)
+            ) as classify,
+            tempfile.TemporaryDirectory(prefix="hermes-native-acceptance-") as root,
+        ):
             accept(
                 evidence,
                 scenarios,
