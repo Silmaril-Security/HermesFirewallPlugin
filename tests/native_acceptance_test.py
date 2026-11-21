@@ -575,6 +575,17 @@ def test_tool_response_block_fails_when_the_poison_reaches_the_model() -> None:
     assert result["checks"]["poison_absent_from_model_requests"] is False
 
 
+def test_all_failed_classifier_calls_keep_the_slowest_duration() -> None:
+    requests = [
+        _classified("user_input", "error", durationMs=3100),
+        _classified("tool_call", "error", durationMs=2300),
+    ]
+    result = _evaluate(native.ALLOW, ALLOW_TOOL_OUTPUT, requests)
+    assert result["status"] == "BLOCKED"
+    assert result["slowest_classifier_ms"] == 3100
+    assert "slowest_classifier_ms" not in _evaluate(native.ALLOW, ALLOW_TOOL_OUTPUT, [])
+
+
 def test_live_classifier_miss_is_blocked_with_a_named_blocker() -> None:
     result = _evaluate(
         native.TOOL_RESPONSE_BLOCK,

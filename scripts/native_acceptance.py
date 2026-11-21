@@ -468,7 +468,7 @@ def evaluate(
                     request["durationMs"] for request in classifier_requests
                 )
             }
-            if any("upstream" in request for request in classifier_requests)
+            if classifier_requests
             else {}
         ),
         "checks": checks,
