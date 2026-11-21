@@ -26,9 +26,8 @@ import tarfile
 import tempfile
 import threading
 import time
-import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from email.message import Message
 from http.client import HTTPException
@@ -36,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+import requests
 
 import firewall
 
@@ -272,18 +273,16 @@ def loopback_classification(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
-        return None
-
-
-def https_fetch(url: str, body: bytes, headers: Mapping[str, str]) -> bytes:
-    request = urllib.request.Request(
-        url, data=body, headers=dict(headers), method="POST"
-    )
-    opener = urllib.request.build_opener(_RefuseRedirects)
-    with opener.open(request, timeout=LIVE_TIMEOUT_SECONDS) as response:
-        return response.read()
+def https_fetch(
+    session: requests.Session, url: str, body: bytes, headers: Mapping[str, str]
+) -> bytes:
+    with session.post(
+        url, data=body, headers=headers, timeout=LIVE_TIMEOUT_SECONDS,
+        allow_redirects=False,
+    ) as response:
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f"live classifier returned HTTP {response.status_code}")
+        return response.content
 
 
 def live_classification(
@@ -798,14 +797,17 @@ def main() -> int:
     scenarios = LIVE_SCENARIOS if live else LOOPBACK_SCENARIOS
     evidence = Evidence(classifier="live" if live else "loopback")
     try:
-        classify = (
-            functools.partial(
-                live_classification, https_fetch, *live_settings(os.environ)
+        with ExitStack() as stack:
+            classify = loopback_classification
+            if live:
+                url, api_key = live_settings(os.environ)
+                # Match the shipped SDK's per-client connection reuse between hooks.
+                session = stack.enter_context(requests.Session())
+                fetch = functools.partial(https_fetch, session)
+                classify = functools.partial(live_classification, fetch, url, api_key)
+            root = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="hermes-native-acceptance-")
             )
-            if live
-            else loopback_classification
-        )
-        with tempfile.TemporaryDirectory(prefix="hermes-native-acceptance-") as root:
             accept(
                 evidence,
                 scenarios,

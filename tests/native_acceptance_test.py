@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,38 @@ def test_recording_classifier_records_loopback_decisions_without_text() -> None:
         "decision",
         "durationMs",
     }
+
+
+def test_live_transport_reuses_connection_and_refuses_redirects() -> None:
+    peers = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            peers.append((self.client_address, self.path))
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(307 if self.path == "/redirect" else 200)
+            self.send_header("Location", "/unexpected")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}"
+            with native.requests.Session() as session:
+                for _ in range(2):
+                    native.https_fetch(session, url + "/classify", b"{}", {})
+                with pytest.raises(ValueError, match="HTTP 307"):
+                    native.https_fetch(session, url + "/redirect", b"{}", {})
+        finally:
+            server.shutdown()
+            thread.join()
+
+    assert [path for _, path in peers] == ["/classify", "/classify", "/redirect"]
+    assert len({peer for peer, _ in peers}) == 1
 
 
 def test_live_classifier_proxies_with_the_customer_key_and_records_upstream() -> None:
