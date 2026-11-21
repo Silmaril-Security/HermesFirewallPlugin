@@ -813,12 +813,20 @@ def test_driver_requires_the_commit_recorded_in_the_archive(tmp_path: Path) -> N
         driver.verify_inputs(release)
 
 
-@pytest.mark.skipif(not ARCHIVE_HELPER.is_file(), reason="shared archive helper absent")
 def test_driver_never_passes_live_without_customer_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     driver = _driver()
     release = _release(tmp_path)
+
+    def unpack_release(_env: dict, archive: Path, destination: Path) -> None:
+        import tarfile
+        destination.mkdir()
+        with tarfile.open(archive) as bundle:
+            for name in ("plugin.yaml", "firewall.py"):
+                (destination / name).write_bytes(bundle.extractfile("source/" + name).read())
+
+    monkeypatch.setattr(driver, "unpack", unpack_release)
     monkeypatch.setattr(
         driver, "prepare_host", lambda *_args: (Path("hermes"), Path("python"))
     )
