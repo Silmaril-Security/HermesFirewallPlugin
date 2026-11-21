@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import functools
+import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -75,7 +78,11 @@ def _evaluate(
 
 def _evidence(*statuses: tuple[str, str]) -> native.Evidence:
     evidence = native.Evidence(classifier="loopback")
-    evidence.plugin.update(artifact_sha256="a" * 64, installed_bytes_match=True)
+    evidence.plugin.update(
+        artifact_sha256="a" * 64,
+        installed_bytes_match=True,
+        dependencies_installed=True,
+    )
     evidence.host["version"] = "0.23.1"
     evidence.scenarios.extend(
         {"id": name, "status": status} for name, status in statuses
@@ -710,3 +717,138 @@ def _is_running(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def test_artifact_members_list_an_unpacked_tree_without_git(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "plugin.yaml").write_text("name: hermes-firewall\n", encoding="utf-8")
+    (tmp_path / "scripts" / "tool.py").write_text("", encoding="utf-8")
+
+    assert native.artifact_members(tmp_path) == ["plugin.yaml", "scripts/tool.py"]
+
+
+def test_receipt_fails_without_installed_dependencies() -> None:
+    evidence = _evidence(*((s.id, "PASS") for s in native.LOOPBACK_SCENARIOS))
+    del evidence.plugin["dependencies_installed"]
+
+    assert native.overall_status(evidence, native.LOOPBACK_SCENARIOS) == "FAIL"
+
+
+DRIVER = Path(native.REPOSITORY) / "scripts" / "customer-published-acceptance"
+ARCHIVE_HELPER = (
+    Path(native.REPOSITORY).parent
+    / "SilmarilCustomerTests"
+    / "scripts"
+    / "unpack_customer_plugin.py"
+)
+
+
+def _driver() -> Any:
+    loader = importlib.machinery.SourceFileLoader("customer_driver", str(DRIVER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _release(tmp_path: Path) -> dict[str, str]:
+    # Historical plugin releases predate the customer acceptance harness.
+    source = tmp_path / "released-plugin"
+    source.mkdir()
+    version = "0.1.0"
+    (source / "plugin.yaml").write_text(f"name: hermes-firewall\nversion: {version}\n")
+    (source / "firewall.py").write_text("released = True\n")
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("add", ".")
+    git("-c", "user.name=QA", "-c", "user.email=qa@example.invalid",
+        "commit", "-qm", "release")
+    head = git("rev-parse", "HEAD")
+    archive = tmp_path / "release.tar.gz"
+    subprocess.run(
+        [
+            "git",
+            "archive",
+            "--format=tar.gz",
+            "--prefix=source/",
+            f"--output={archive}",
+            head,
+        ],
+        cwd=source,
+        check=True,
+    )
+    return {
+        "CUSTOMER_ARTIFACT": str(archive),
+        "CUSTOMER_VERSION": version,
+        "CUSTOMER_SOURCE_SHA": head,
+        "CUSTOMER_ARTIFACT_SHA256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "CUSTOMER_ARCHIVE_HELPER": str(ARCHIVE_HELPER),
+        "CUSTOMER_RESULT": str(tmp_path / "result.json"),
+    }
+
+
+def test_driver_is_executable_python() -> None:
+    assert os.access(DRIVER, os.X_OK)
+    compile(DRIVER.read_text(encoding="utf-8"), str(DRIVER), "exec")
+
+
+def test_driver_fails_closed_on_a_wrong_digest(tmp_path: Path) -> None:
+    release = _release(tmp_path) | {"CUSTOMER_ARTIFACT_SHA256": "0" * 64}
+
+    assert _driver().main(release) == 1
+
+    result = json.loads(Path(release["CUSTOMER_RESULT"]).read_text())
+    assert result == {"install": "FAIL", "native": "BLOCKED", "live": "BLOCKED"}
+
+
+def test_driver_requires_the_commit_recorded_in_the_archive(tmp_path: Path) -> None:
+    driver = _driver()
+    release = _release(tmp_path) | {"CUSTOMER_SOURCE_SHA": "0" * 40}
+    with pytest.raises(driver.Rejected, match="archived commit"):
+        driver.verify_inputs(release)
+
+
+def test_driver_never_passes_live_without_customer_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    driver = _driver()
+    release = _release(tmp_path)
+
+    def unpack_release(_env: dict, archive: Path, destination: Path) -> None:
+        import tarfile
+        destination.mkdir()
+        with tarfile.open(archive) as bundle:
+            for name in ("plugin.yaml", "firewall.py"):
+                (destination / name).write_bytes(bundle.extractfile("source/" + name).read())
+
+    monkeypatch.setattr(driver, "unpack", unpack_release)
+    monkeypatch.setattr(
+        driver, "prepare_host", lambda *_args: (Path("hermes"), Path("python"))
+    )
+    runs: list[str] = []
+
+    def run_harness(
+        name: str, _work: Path, _env: dict, source: Path, *_args: Any
+    ) -> tuple[str, dict]:
+        runs.append(name)
+        assert (source / "firewall.py").read_text() == "released = True\n"
+        assert not (source / "requirements-native.txt").exists()
+        plugin = {
+            "version": release["CUSTOMER_VERSION"],
+            "installed_bytes_match": True,
+            "dependencies_installed": True,
+        }
+        return "PASS", {"plugin": plugin}
+
+    monkeypatch.setattr(driver, "run_harness", run_harness)
+
+    assert driver.main(release) == 1
+
+    result = json.loads(Path(release["CUSTOMER_RESULT"]).read_text())
+    assert result == {"install": "PASS", "native": "PASS", "live": "BLOCKED"}
+    assert runs == ["native"]

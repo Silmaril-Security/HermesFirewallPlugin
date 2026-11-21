@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Customer journey for the published HermesFirewallPlugin source archive.
+
+Environment: CUSTOMER_ARTIFACT, CUSTOMER_VERSION, CUSTOMER_SOURCE_SHA,
+CUSTOMER_ARTIFACT_SHA256, CUSTOMER_RESULT, CUSTOMER_ARCHIVE_HELPER, plus the
+optional CUSTOMER_NATIVE_API_URL / CUSTOMER_NATIVE_API_KEY for the live case.
+
+The archive is unpacked with the shared helper, a pinned Hermes v0.23.1 host is
+prepared, and the existing ``scripts.native_acceptance`` harness installs the
+unpacked package through ``hermes plugins install file://`` twice: against its
+local classifier (native) and against the customer Cascade endpoint (live).
+CUSTOMER_RESULT holds only {"install", "native", "live"} statuses.
+"""
+
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+HERMES_URL = "https://github.com/NousResearch/hermes-agent.git"
+HERMES_COMMIT = "3b421578588243f920886e6fe79a6faa87ea026e"  # Hermes v0.23.1
+STAGES = ("install", "native", "live")
+
+
+class Rejected(Exception):
+    """Observed failed validation."""
+
+
+class Blocked(Exception):
+    """A required prerequisite is unavailable."""
+
+
+def write_result(path, results):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".result-")
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(results, stream, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def verify_inputs(env):
+    """Check identity of the supplied bytes; return the archive path."""
+    for name in ("CUSTOMER_ARTIFACT", "CUSTOMER_VERSION", "CUSTOMER_SOURCE_SHA",
+                 "CUSTOMER_ARTIFACT_SHA256", "CUSTOMER_ARCHIVE_HELPER"):
+        if not env.get(name):
+            raise Blocked(f"{name} is required")
+    patterns = (
+        ("CUSTOMER_VERSION", r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"),
+        ("CUSTOMER_SOURCE_SHA", r"[0-9a-f]{40}"),
+        ("CUSTOMER_ARTIFACT_SHA256", r"[0-9a-f]{64}"),
+    )
+    for name, pattern in patterns:
+        if not re.fullmatch(pattern, env[name]):
+            raise Rejected(f"{name} is malformed")
+    artifact = Path(env["CUSTOMER_ARTIFACT"])
+    if not artifact.is_absolute():
+        raise Rejected("CUSTOMER_ARTIFACT must be absolute")
+    if not artifact.is_file():
+        raise Blocked("CUSTOMER_ARTIFACT does not exist")
+    if hashlib.sha256(artifact.read_bytes()).hexdigest() != env["CUSTOMER_ARTIFACT_SHA256"]:
+        raise Rejected("artifact digest mismatch")
+    try:  # git archive records the archived commit as the pax comment
+        with tarfile.open(artifact, "r:gz") as archive:
+            archive.next()
+            commit = archive.pax_headers.get("comment")
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise Rejected("artifact is not a readable tar.gz") from error
+    if commit != env["CUSTOMER_SOURCE_SHA"]:
+        raise Rejected("archived commit differs from CUSTOMER_SOURCE_SHA")
+    return artifact
+
+
+def unpack(env, artifact, destination):
+    helper = subprocess.run(
+        [sys.executable, env["CUSTOMER_ARCHIVE_HELPER"], artifact, destination,
+         "--prefix", "source"],
+        stdout=sys.stderr,
+    )
+    if helper.returncode:
+        raise Rejected("archive helper rejected the artifact")
+    manifest = (destination / "plugin.yaml").read_text()
+    versions = re.findall(r"^version:\s*(\S+)\s*$", manifest, re.M)
+    if versions != [env["CUSTOMER_VERSION"]]:
+        raise Rejected("package version differs from CUSTOMER_VERSION")
+
+
+def clean_environment(work, env):
+    home = work / "home"
+    home.mkdir(exist_ok=True)
+    return {
+        "PATH": env.get("PATH", os.defpath), "LANG": "C.UTF-8", "HOME": str(home),
+        "TMPDIR": str(work), "UV_CACHE_DIR": str(work / "uv-cache"),
+        "UV_PYTHON_INSTALL_DIR": str(work / "uv-python"),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def prepare_host(work, environment):
+    """Build the pinned Hermes CLI as qualification.yml does; return its path."""
+    system = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
+    machine = {"x86_64": "x64", "amd64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(
+        platform.machine().lower())
+    if not (system and machine):
+        raise Blocked("unsupported runner OS")
+    hermes = work / "hermes-agent"
+    venv = work / "hermes-venv"
+
+    def run(*command, env=environment):
+        subprocess.run(command, check=True, env=env, stdout=sys.stderr)
+
+    def verified():
+        head = subprocess.run(["git", "-C", hermes, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", hermes, "status", "--porcelain=v1", "--untracked-files=all"],
+            capture_output=True, text=True).stdout
+        if head != HERMES_COMMIT or dirty:
+            raise Rejected("Hermes host is not the pinned clean v0.23.1 commit")
+
+    try:
+        run("git", "init", "--quiet", hermes)
+        run("git", "-C", hermes, "remote", "add", "origin", HERMES_URL)
+        run("git", "-C", hermes, "fetch", "--quiet", "--depth=1", "origin", HERMES_COMMIT)
+        run("git", "-C", hermes, "checkout", "--quiet", "--detach", HERMES_COMMIT)
+        verified()
+        uv = json.loads((hermes / "pm" / "lock.json").read_text())["packages"]["uv"][
+            "artifacts"][f"{system}-{machine}"]
+        tarball = work / "uv.tar.gz"
+        run("curl", "--fail", "--silent", "--location", "--proto", "=https",
+            "--tlsv1.2", "-o", tarball, uv["url"])
+        if hashlib.sha256(tarball.read_bytes()).hexdigest() != uv["sha256"]:
+            raise Rejected("pinned uv digest mismatch")
+        (work / "uv").mkdir()
+        run("tar", "-xzf", tarball, "-C", work / "uv", "--strip-components=1")
+        run(work / "uv" / "uv", "sync", "--frozen", "--no-dev", "--python", "3.14",
+            "--project", hermes, env=environment | {"UV_PROJECT_ENVIRONMENT": str(venv)})
+        verified()
+        run(sys.executable, "-m", "venv", work / "harness-venv")
+        run(work / "harness-venv" / "bin" / "python", "-m", "pip", "install", "--quiet",
+            "--requirement", REPOSITORY / "requirements-native.txt")
+    except (OSError, KeyError, ValueError, subprocess.CalledProcessError) as error:
+        raise Blocked(f"host preparation failed: {type(error).__name__}") from error
+    return venv / "bin" / "hermes", work / "harness-venv" / "bin" / "python"
+
+
+def run_harness(name, work, environment, source, hermes, python, sha, extra=None):
+    """Run the existing harness; return (status, private receipt)."""
+    receipt = work / f"{name}.json"
+    process = subprocess.run(
+        [python, "-m", "scripts.native_acceptance"], cwd=REPOSITORY, stdout=sys.stderr,
+        env=environment | {
+            "HERMES_BIN": str(hermes), "NATIVE_ACCEPTANCE_RECEIPT": str(receipt),
+            "NATIVE_ACCEPTANCE_SOURCE": str(source), "GITHUB_SHA": sha, **(extra or {}),
+        },
+    )
+    status = {0: "PASS", 3: "BLOCKED"}.get(process.returncode, "FAIL")
+    try:
+        evidence = json.loads(receipt.read_text())
+        classifier = "live" if name == "live" else "loopback"
+        if (evidence.get("schema") != "silmaril.native-acceptance.v1"
+                or evidence.get("source_sha") != sha or evidence.get("classifier") != classifier
+                or evidence.get("status") != status):
+            return "FAIL", evidence
+        return status, evidence
+    except (OSError, ValueError):
+        return "FAIL", {}
+
+
+def live_settings(env):
+    url, key = env.get("CUSTOMER_NATIVE_API_URL"), env.get("CUSTOMER_NATIVE_API_KEY")
+    if not (url and key):
+        return None
+    return {"CUSTOMER_NATIVE_CLASSIFIER": "live", "CUSTOMER_NATIVE_API_URL": url,
+            "CUSTOMER_NATIVE_API_KEY": key}
+
+
+def accept(env, work, results):
+    artifact = verify_inputs(env)
+    source = work / "source"
+    unpack(env, artifact, source)
+    environment = clean_environment(work, env)
+    hermes, python = prepare_host(work, environment)
+    sha = env["CUSTOMER_SOURCE_SHA"]
+    results["native"], receipt = run_harness(
+        "native", work, environment, source, hermes, python, sha)
+    plugin = receipt.get("plugin", {})
+    installed = (plugin.get("version") == env["CUSTOMER_VERSION"]
+                 and plugin.get("installed_bytes_match") is True
+                 and plugin.get("dependencies_installed") is True)
+    results["install"] = "PASS" if installed else "FAIL"
+    live = live_settings(env)
+    if live is None:
+        print("live: CUSTOMER_NATIVE_API_URL and CUSTOMER_NATIVE_API_KEY are required",
+              file=sys.stderr)
+    else:
+        results["live"], _ = run_harness(
+            "live", work, environment, source, hermes, python, sha, live)
+
+
+def main(env=None):
+    env = dict(os.environ if env is None else env)
+    if not env.get("CUSTOMER_RESULT"):
+        print("CUSTOMER_RESULT is required", file=sys.stderr)
+        return 2
+    path = Path(env["CUSTOMER_RESULT"])
+    results = dict.fromkeys(STAGES, "BLOCKED")
+    write_result(path, results)
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-customer-") as work:
+            accept(env, Path(work), results)
+    except Rejected as error:
+        results["install"] = "FAIL"
+        print(f"install: {error}", file=sys.stderr)
+    except Blocked as error:
+        print(f"install: {error}", file=sys.stderr)
+    finally:
+        write_result(path, results)
+    print(json.dumps(results, sort_keys=True), file=sys.stderr)
+    return 0 if set(results.values()) == {"PASS"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
