@@ -14,10 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from scripts import native_acceptance as native
+
 
 LIVE_SETTINGS = {
     "CUSTOMER_NATIVE_API_URL": "https://cascade.test/classify",
@@ -26,6 +28,28 @@ LIVE_SETTINGS = {
 ALLOW_TOOL_OUTPUT = json.dumps(
     {"resolved_path": f"/workspace/{native.ALLOW.effect_file}"}
 )
+
+
+def test_live_transport_reuses_session_and_refuses_redirects():
+    ok = MagicMock(status_code=200, content=b'{"prediction":"BENIGN"}')
+    redirect = MagicMock(status_code=307)
+    for response in (ok, redirect):
+        response.__enter__.return_value = response
+    with patch("requests.Session") as factory:
+        session = factory.return_value.__enter__.return_value
+        session.post.side_effect = [ok, ok, redirect]
+        with native.live_classifier(LIVE_SETTINGS) as classify:
+            assert classify({"text": "release note"})["prediction"] == "BENIGN"
+            assert classify({"text": "release note"})["prediction"] == "BENIGN"
+            with pytest.raises(ValueError, match="307"):
+                classify({"text": "release note"})
+        factory.assert_called_once_with()
+        factory.return_value.__exit__.assert_called_once()
+        assert session.post.call_count == 3
+        assert all(
+            call.kwargs["allow_redirects"] is False
+            for call in session.post.call_args_list
+        )
 
 
 def _headers(api_key: str = native.CLASSIFIER_KEY) -> Message:
@@ -549,6 +573,17 @@ def test_tool_response_block_fails_when_the_poison_reaches_the_model() -> None:
 
     assert result["status"] == "FAIL"
     assert result["checks"]["poison_absent_from_model_requests"] is False
+
+
+def test_all_failed_classifier_calls_keep_the_slowest_duration() -> None:
+    requests = [
+        _classified("user_input", "error", durationMs=3100),
+        _classified("tool_call", "error", durationMs=2300),
+    ]
+    result = _evaluate(native.ALLOW, ALLOW_TOOL_OUTPUT, requests)
+    assert result["status"] == "BLOCKED"
+    assert result["slowest_classifier_ms"] == 3100
+    assert "slowest_classifier_ms" not in _evaluate(native.ALLOW, ALLOW_TOOL_OUTPUT, [])
 
 
 def test_live_classifier_miss_is_blocked_with_a_named_blocker() -> None:
