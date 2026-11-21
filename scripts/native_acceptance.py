@@ -7,6 +7,9 @@ Run from the repository root with the pinned host binary::
 The repository tree is packed, installed with ``hermes plugins install``, and
 exercised through ``hermes -z`` against a loopback scripted model and a
 loopback Cascade ``/classify`` endpoint reached through the real SDK.
+
+``NATIVE_ACCEPTANCE_SOURCE`` names an unpacked source tree to install instead of
+the repository (used by ``scripts/customer-published-acceptance``).
 """
 
 from __future__ import annotations
@@ -499,6 +502,7 @@ def overall_status(evidence: Evidence, expected: Sequence[Scenario]) -> str:
     if (
         evidence.error
         or evidence.plugin.get("installed_bytes_match") is not True
+        or evidence.plugin.get("dependencies_installed") is not True
         or set(statuses) != {scenario.id for scenario in expected}
         or "FAIL" in statuses.values()
     ):
@@ -534,6 +538,12 @@ def build_receipt(
 
 
 def artifact_members(repository: Path) -> list[str]:
+    if not (repository / ".git").exists():
+        return sorted(
+            path.relative_to(repository).as_posix()
+            for path in repository.rglob("*")
+            if path.is_file()
+        )
     listing = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=repository,
@@ -653,6 +663,7 @@ def accept(
     poison: str,
     hermes_bin: str,
     root: Path,
+    source: Path,
 ) -> None:
     directories = {
         name: root / name for name in ("home", "hermes", "tmp", "workspace", "uv-cache")
@@ -712,7 +723,7 @@ def accept(
                 "Hermes Agent "
             )
             artifact, evidence.plugin["artifact_sha256"] = stage_artifact(
-                REPOSITORY, root, environment
+                source, root, environment
             )
             hermes(
                 [
@@ -744,6 +755,7 @@ def accept(
                 stdout=sys.stderr,
                 check=True,
             )
+            evidence.plugin["dependencies_installed"] = True
             for scenario in scenarios:
                 first_chat = len(chat_requests)
                 first_classification = len(evidence.classifier_requests)
@@ -798,6 +810,7 @@ def main() -> int:
                 LIVE_ATTACK if live else LOOPBACK_POISON,
                 os.environ["HERMES_BIN"],
                 Path(root).resolve(),
+                Path(os.environ.get("NATIVE_ACCEPTANCE_SOURCE") or REPOSITORY),
             )
     except BaseException as error:
         evidence.error = type(error).__name__
