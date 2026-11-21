@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -112,7 +113,6 @@ class Evidence:
     plugin: dict[str, Any] = field(
         default_factory=lambda: {
             "name": firewall.PLUGIN_NAME,
-            "version": firewall.PLUGIN_VERSION,
             "install_command": INSTALL_COMMAND,
         }
     )
@@ -725,6 +725,9 @@ def accept(
             artifact, evidence.plugin["artifact_sha256"] = stage_artifact(
                 source, root, environment
             )
+            manifest = (artifact / "plugin.yaml").read_text(encoding="utf-8")
+            (version,) = re.findall(r"^version:\s*(\S+)\s*$", manifest, re.MULTILINE)
+            evidence.plugin["version"] = version
             hermes(
                 [
                     hermes_bin,

@@ -752,13 +752,23 @@ def _driver() -> Any:
 
 
 def _release(tmp_path: Path) -> dict[str, str]:
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=native.REPOSITORY,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    # Historical plugin releases predate the customer acceptance harness.
+    source = tmp_path / "released-plugin"
+    source.mkdir()
+    version = "0.1.0"
+    (source / "plugin.yaml").write_text(f"name: hermes-firewall\nversion: {version}\n")
+    (source / "firewall.py").write_text("released = True\n")
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("add", ".")
+    git("-c", "user.name=QA", "-c", "user.email=qa@example.invalid",
+        "commit", "-qm", "release")
+    head = git("rev-parse", "HEAD")
     archive = tmp_path / "release.tar.gz"
     subprocess.run(
         [
@@ -769,13 +779,8 @@ def _release(tmp_path: Path) -> dict[str, str]:
             f"--output={archive}",
             head,
         ],
-        cwd=native.REPOSITORY,
+        cwd=source,
         check=True,
-    )
-    version = next(
-        line.split()[1]
-        for line in (native.REPOSITORY / "plugin.yaml").read_text().splitlines()
-        if line.startswith("version:")
     )
     return {
         "CUSTOMER_ARTIFACT": str(archive),
@@ -801,6 +806,13 @@ def test_driver_fails_closed_on_a_wrong_digest(tmp_path: Path) -> None:
     assert result == {"install": "FAIL", "native": "BLOCKED", "live": "BLOCKED"}
 
 
+def test_driver_requires_the_commit_recorded_in_the_archive(tmp_path: Path) -> None:
+    driver = _driver()
+    release = _release(tmp_path) | {"CUSTOMER_SOURCE_SHA": "0" * 40}
+    with pytest.raises(driver.Rejected, match="archived commit"):
+        driver.verify_inputs(release)
+
+
 @pytest.mark.skipif(not ARCHIVE_HELPER.is_file(), reason="shared archive helper absent")
 def test_driver_never_passes_live_without_customer_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -812,9 +824,17 @@ def test_driver_never_passes_live_without_customer_credentials(
     )
     runs: list[str] = []
 
-    def run_harness(name: str, *_args: Any, **_kwargs: Any) -> tuple[str, dict]:
+    def run_harness(
+        name: str, _work: Path, _env: dict, source: Path, *_args: Any
+    ) -> tuple[str, dict]:
         runs.append(name)
-        plugin = {"installed_bytes_match": True, "dependencies_installed": True}
+        assert (source / "firewall.py").read_text() == "released = True\n"
+        assert not (source / "requirements-native.txt").exists()
+        plugin = {
+            "version": release["CUSTOMER_VERSION"],
+            "installed_bytes_match": True,
+            "dependencies_installed": True,
+        }
         return "PASS", {"plugin": plugin}
 
     monkeypatch.setattr(driver, "run_harness", run_harness)

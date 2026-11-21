@@ -91,10 +91,6 @@ def unpack(env, artifact, destination):
     versions = re.findall(r"^version:\s*(\S+)\s*$", manifest, re.M)
     if versions != [env["CUSTOMER_VERSION"]]:
         raise Rejected("package version differs from CUSTOMER_VERSION")
-    head = subprocess.run(["git", "-C", REPOSITORY, "rev-parse", "HEAD"],
-                          capture_output=True, text=True)
-    if head.stdout.strip() != env["CUSTOMER_SOURCE_SHA"]:
-        raise Rejected("checkout is not the released commit")
 
 
 def clean_environment(work, env):
@@ -108,7 +104,7 @@ def clean_environment(work, env):
     }
 
 
-def prepare_host(work, environment, source):
+def prepare_host(work, environment):
     """Build the pinned Hermes CLI as qualification.yml does; return its path."""
     system = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
     machine = {"x86_64": "x64", "amd64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(
@@ -150,7 +146,7 @@ def prepare_host(work, environment, source):
         verified()
         run(sys.executable, "-m", "venv", work / "harness-venv")
         run(work / "harness-venv" / "bin" / "python", "-m", "pip", "install", "--quiet",
-            "--requirement", source / "requirements-native.txt")
+            "--requirement", REPOSITORY / "requirements-native.txt")
     except (OSError, KeyError, ValueError, subprocess.CalledProcessError) as error:
         raise Blocked(f"host preparation failed: {type(error).__name__}") from error
     return venv / "bin" / "hermes", work / "harness-venv" / "bin" / "python"
@@ -192,13 +188,14 @@ def accept(env, work, results):
     source = work / "source"
     unpack(env, artifact, source)
     environment = clean_environment(work, env)
-    hermes, python = prepare_host(work, environment, source)
+    hermes, python = prepare_host(work, environment)
     sha = env["CUSTOMER_SOURCE_SHA"]
     results["native"], receipt = run_harness(
         "native", work, environment, source, hermes, python, sha)
     plugin = receipt.get("plugin", {})
-    installed = plugin.get("installed_bytes_match") is True and plugin.get(
-        "dependencies_installed") is True
+    installed = (plugin.get("version") == env["CUSTOMER_VERSION"]
+                 and plugin.get("installed_bytes_match") is True
+                 and plugin.get("dependencies_installed") is True)
     results["install"] = "PASS" if installed else "FAIL"
     live = live_settings(env)
     if live is None:
