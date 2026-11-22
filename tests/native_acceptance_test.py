@@ -39,10 +39,13 @@ def test_live_transport_reuses_session_and_refuses_redirects():
         session = factory.return_value.__enter__.return_value
         session.post.side_effect = [ok, ok, redirect]
         with native.live_classifier(LIVE_SETTINGS) as classify:
-            assert classify({"text": "release note"})["prediction"] == "BENIGN"
-            assert classify({"text": "release note"})["prediction"] == "BENIGN"
+            for _ in range(2):
+                assert (
+                    classify(native.V1_ROUTE, {"text": "release note"})["prediction"]
+                    == "BENIGN"
+                )
             with pytest.raises(ValueError, match="307"):
-                classify({"text": "release note"})
+                classify(native.V1_ROUTE, {"text": "release note"})
         factory.assert_called_once_with()
         factory.return_value.__exit__.assert_called_once()
         assert session.post.call_count == 3
@@ -170,28 +173,44 @@ def test_scripted_provider_records_only_chat_requests() -> None:
         requests, lambda _request: {"role": "assistant", "content": native.FINAL_REPLY}
     )
 
-    assert respond(_headers(), {"name": native.MODEL_NAME}).status == 404
-    assert respond(_headers(), {"messages": []}).status == 200
+    assert respond("/v1/models", _headers(), {"name": native.MODEL_NAME}).status == 404
+    assert respond("/v1/chat/completions", _headers(), {"messages": []}).status == 200
     assert requests == [{"messages": []}]
 
 
 @pytest.mark.parametrize(
-    ("hook", "text", "prediction"),
+    ("hook", "text", "blocked"),
     [
-        ("tool_call", native.PRE_TOOL_BLOCK_MARKER, "MALICIOUS"),
-        ("tool_response", native.LOOPBACK_POISON, "MALICIOUS"),
-        ("tool_response", native.PRE_TOOL_BLOCK_MARKER, "BENIGN"),
-        ("user_input", native.LOOPBACK_POISON, "BENIGN"),
-        ("tool_call", native.RELEASE_SUMMARY, "BENIGN"),
+        ("tool_call", native.PRE_TOOL_BLOCK_MARKER, True),
+        ("tool_response", native.LOOPBACK_POISON, True),
+        ("tool_response", native.PRE_TOOL_BLOCK_MARKER, False),
+        ("user_input", native.LOOPBACK_POISON, False),
+        ("tool_call", native.RELEASE_SUMMARY, False),
     ],
 )
-def test_loopback_classification_blocks_only_marked_hooks(
-    hook: str, text: str, prediction: str
+def test_loopback_classification_blocks_only_marked_hooks_on_both_routes(
+    hook: str, text: str, blocked: bool
 ) -> None:
-    assert (
-        native.loopback_classification({"hook": hook, "text": text})["prediction"]
-        == prediction
-    )
+    payload = {"hook": hook, "text": text}
+
+    version2 = native.loopback_classification(native.V2_ROUTE, payload)
+    version1 = native.loopback_classification(native.V1_ROUTE, payload)
+
+    assert version2 == {
+        "results": [
+            {
+                "action": "block" if blocked else "allow",
+                "source": "model" if blocked else None,
+                "confidence": "very_high" if blocked else None,
+                "severity": "high" if blocked else None,
+                "outcome": "control_abuse" if blocked else None,
+                "governance": None,
+                "model_id": None,
+            }
+        ]
+    }
+    assert version1["prediction"] == ("MALICIOUS" if blocked else "BENIGN")
+    assert "results" not in version1
 
 
 def test_recording_classifier_records_loopback_decisions_without_text() -> None:
@@ -199,21 +218,24 @@ def test_recording_classifier_records_loopback_decisions_without_text() -> None:
     respond = native.recording_classifier(
         records, native.loopback_classification, threading.Condition(), live=False
     )
+    attack = {
+        "hook": "tool_call",
+        "tool_name": "write_file",
+        "text": native.PRE_TOOL_BLOCK_MARKER,
+    }
 
-    reply = respond(
-        _headers(),
-        {
-            "hook": "tool_call",
-            "tool_name": "write_file",
-            "text": native.PRE_TOOL_BLOCK_MARKER,
-        },
-    )
+    version2 = respond(native.V2_ROUTE, _headers(), attack)
+    version1 = respond(native.V1_ROUTE, _headers(), attack)
     respond(
-        _headers("another-key"), {"hook": "user_input", "text": native.RELEASE_SUMMARY}
+        native.V2_ROUTE,
+        _headers("another-key"),
+        {"hook": "user_input", "text": native.RELEASE_SUMMARY},
     )
 
-    assert json.loads(reply.body)["prediction"] == "MALICIOUS"
+    assert json.loads(version2.body)["results"][0]["action"] == "block"
+    assert json.loads(version1.body)["prediction"] == "MALICIOUS"
     assert [(record["decision"], record["authenticated"]) for record in records] == [
+        ("block", True),
         ("block", True),
         ("allow", False),
     ]
@@ -253,11 +275,11 @@ def test_live_classifier_proxies_with_the_customer_key_and_records_upstream() ->
         live=True,
     )
 
-    reply = respond(_headers(), payload)
+    reply = respond(native.V1_ROUTE, _headers(), payload)
 
     assert sent == [
         (
-            "https://cascade.test",
+            "https://cascade.test/classify",
             json.dumps(payload).encode(),
             {"content-type": "application/json", "x-api-key": "live-key"},
         )
@@ -270,6 +292,106 @@ def test_live_classifier_proxies_with_the_customer_key_and_records_upstream() ->
         "action": "block",
     }
     assert "live-key" not in json.dumps(records)
+
+
+def test_live_classifier_relays_version_2_to_the_matching_upstream_route() -> None:
+    sent: list[str] = []
+    verdict = {"results": [{"action": "block", "source": "model"}]}
+
+    def fetch(url: str, _body: bytes, _headers: dict[str, str]) -> bytes:
+        sent.append(url)
+        return json.dumps(verdict).encode()
+
+    records: list[dict[str, Any]] = []
+    respond = native.recording_classifier(
+        records,
+        functools.partial(
+            native.live_classification,
+            fetch,
+            "https://cascade.test/stage/classify?tenant=acme",
+            "live-key",
+        ),
+        threading.Condition(),
+        live=True,
+    )
+
+    reply = respond(
+        native.V2_ROUTE,
+        _headers(),
+        {"hook": "tool_response", "text": native.LIVE_ATTACK},
+    )
+
+    assert sent == ["https://cascade.test/stage/v2/classify?tenant=acme"]
+    assert json.loads(reply.body) == verdict
+    assert records[0]["decision"] == "block"
+    assert records[0]["upstream"] == {"action": "block", "source": "model"}
+
+
+@pytest.mark.parametrize("status", sorted(native.ROUTE_FALLBACK_STATUSES))
+def test_live_classifier_passes_a_missing_version_2_route_to_the_sdk(
+    status: int,
+) -> None:
+    sent: list[str] = []
+
+    def fetch(url: str, _body: bytes, _headers: dict[str, str]) -> bytes:
+        sent.append(url)
+        if url.endswith(native.V2_ROUTE):
+            raise native.UpstreamStatus(status)
+        return b'{"prediction": "MALICIOUS"}'
+
+    records: list[dict[str, Any]] = []
+    settled = threading.Condition()
+    respond = native.recording_classifier(
+        records,
+        functools.partial(
+            native.live_classification,
+            fetch,
+            "https://cascade.test/v2/classify/",
+            "live-key",
+        ),
+        settled,
+        live=True,
+    )
+    payload = {"hook": "tool_response", "text": native.LIVE_ATTACK}
+
+    probe = respond(native.V2_ROUTE, _headers(), payload)
+
+    assert probe.status == status
+    assert records == []
+    native.await_settled(records, settled)
+
+    fallback = respond(native.V1_ROUTE, _headers(), payload)
+
+    assert sent == [
+        "https://cascade.test/v2/classify",
+        "https://cascade.test/classify",
+    ]
+    assert json.loads(fallback.body) == {"prediction": "MALICIOUS"}
+    assert [record["decision"] for record in records] == ["block"]
+
+
+@pytest.mark.parametrize(
+    ("path", "status"),
+    [(native.V2_ROUTE, 500), (native.V2_ROUTE, 401), (native.V1_ROUTE, 403)],
+)
+def test_live_classifier_reports_other_upstream_statuses_as_bad_gateway(
+    path: str, status: int
+) -> None:
+    def fetch(_url: str, _body: bytes, _headers: dict[str, str]) -> bytes:
+        raise native.UpstreamStatus(status)
+
+    records: list[dict[str, Any]] = []
+    respond = native.recording_classifier(
+        records,
+        functools.partial(
+            native.live_classification, fetch, "https://cascade.test", "live-key"
+        ),
+        threading.Condition(),
+        live=True,
+    )
+
+    assert respond(path, _headers(), {"hook": "user_input", "text": "hello"}).status == 502
+    assert [record["decision"] for record in records] == ["error"]
 
 
 @pytest.mark.parametrize(
@@ -292,18 +414,32 @@ def test_live_classifier_reports_transport_failures_as_bad_gateway(
         live=True,
     )
 
-    assert respond(_headers(), {"hook": "user_input", "text": "hello"}).status == 502
+    assert (
+        respond(
+            native.V2_ROUTE, _headers(), {"hook": "user_input", "text": "hello"}
+        ).status
+        == 502
+    )
     assert records[0]["decision"] == "error"
     assert "upstream" not in records[0]
 
 
-def test_live_classifier_rejects_responses_without_a_prediction() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"message": "Forbidden"}',
+        b'{"results": []}',
+        b'{"results": [{"source": "model"}]}',
+        b'{"results": [{"action": "allow"}, {"action": "block"}]}',
+    ],
+)
+def test_live_classifier_rejects_responses_without_a_decision(body: bytes) -> None:
     records: list[dict[str, Any]] = []
     respond = native.recording_classifier(
         records,
         functools.partial(
             native.live_classification,
-            lambda _url, _body, _headers: b'{"message": "Forbidden"}',
+            lambda _url, _body, _headers: body,
             "https://cascade.test",
             "live-key",
         ),
@@ -311,7 +447,12 @@ def test_live_classifier_rejects_responses_without_a_prediction() -> None:
         live=True,
     )
 
-    assert respond(_headers(), {"hook": "user_input", "text": "hello"}).status == 502
+    assert (
+        respond(
+            native.V2_ROUTE, _headers(), {"hook": "user_input", "text": "hello"}
+        ).status
+        == 502
+    )
     assert records[0]["decision"] == "error"
 
 
@@ -319,10 +460,10 @@ def test_pending_classifier_requests_settle_before_evaluation() -> None:
     entered = threading.Event()
     release = threading.Event()
 
-    def classify(payload: dict[str, Any]) -> dict[str, Any]:
+    def classify(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         entered.set()
         release.wait()
-        return native.loopback_classification(payload)
+        return native.loopback_classification(path, payload)
 
     records: list[dict[str, Any]] = []
     settled = threading.Condition()
@@ -330,7 +471,10 @@ def test_pending_classifier_requests_settle_before_evaluation() -> None:
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         reply = pool.submit(
-            respond, _headers(), {"hook": "tool_call", "text": native.RELEASE_SUMMARY}
+            respond,
+            native.V2_ROUTE,
+            _headers(),
+            {"hook": "tool_call", "text": native.RELEASE_SUMMARY},
         )
         entered.wait()
         assert "decision" not in records[0]
@@ -482,7 +626,7 @@ def test_live_pass_does_not_depend_on_the_upstream_mode() -> None:
     records: list[dict[str, Any]] = []
     respond = native.recording_classifier(
         records,
-        lambda _payload: {
+        lambda _path, _payload: {
             "prediction": "MALICIOUS",
             "mode": None,
             "governance": {"action": "allow"},
@@ -490,7 +634,9 @@ def test_live_pass_does_not_depend_on_the_upstream_mode() -> None:
         threading.Condition(),
         live=True,
     )
-    respond(_headers(), {"hook": "tool_response", "text": native.LIVE_ATTACK})
+    respond(
+        native.V1_ROUTE, _headers(), {"hook": "tool_response", "text": native.LIVE_ATTACK}
+    )
 
     result = _evaluate(
         native.TOOL_RESPONSE_BLOCK,

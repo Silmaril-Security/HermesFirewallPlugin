@@ -24,6 +24,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
+from silmaril_security.sdk import BlockResult, GovernanceDecision
+
 import firewall
 from scripts.native_acceptance import (
     ISOLATED_HOST_CONFIG,
@@ -36,24 +38,29 @@ HERMES_023_COMMIT = "3b421578588243f920886e6fe79a6faa87ea026e"
 MALICIOUS_TOKEN = "NATIVE-MALICIOUS-TOKEN"
 
 
-def _decision(*, malicious: bool = False, governance: bool = False) -> dict:
-    return {
-        "prediction": "MALICIOUS" if malicious else "BENIGN",
-        "score": 0.99 if malicious else 0.01,
-        "threshold": 0.5,
-        "mode": os.environ["SILMARIL_MODE"],
-        "governance": (
-            {
-                "action": "block",
-                "policy_version": "native-test",
-                "rule_id": "native-test-rule",
-            }
-            if governance
-            else None
-        ),
-        "primary_outcome": "prompt_injection" if malicious else "benign",
-        "blocked": malicious or governance,
-    }
+def _decision(*, malicious: bool = False, governance: bool = False) -> BlockResult:
+    mode = os.environ["SILMARIL_MODE"]
+    if malicious:
+        return BlockResult(
+            action="block",
+            source="model",
+            confidence="very_high",
+            severity="high",
+            outcome="control_abuse",
+            mode=mode,
+        )
+    if governance:
+        return BlockResult(
+            action="block",
+            source="governance",
+            governance=GovernanceDecision(
+                action="block",
+                policy_version="native-test",
+                rule_id="native-test-rule",
+            ),
+            mode=mode,
+        )
+    return BlockResult(action="allow", mode=mode)
 
 
 def _agent(provider_url: str):
@@ -210,7 +217,7 @@ class Hermes023NativeQualificationTests(unittest.TestCase):
         malicious: bool = False,
         governance: bool = False,
     ) -> None:
-        def observe(event: str, *_args: object, **_kwargs: object) -> dict:
+        def observe(event: str, *_args: object, **_kwargs: object) -> BlockResult:
             if event == "pre_llm_call":
                 return _decision(malicious=malicious, governance=governance)
             return _decision()

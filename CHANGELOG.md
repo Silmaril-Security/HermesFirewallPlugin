@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 - Source candidate
+
+- Move to `silmaril-security-sdk` 1.0.0, which calls `/v2/classify` and falls
+  back to `/classify` on deployments without it. `SILMARIL_API_URL` and every
+  other setting are unchanged.
+- Decide every boundary on the typed SDK result: a block candidate is
+  `result.blocked` (`action` other than `allow`). A block whose `source` is
+  `governance` keeps policy-denial copy and a benign recorded prediction. The
+  plugin no longer reads `prediction`, `score`, `threshold`,
+  `primary_outcome`, or the score maps, which SDK 1.0 removed.
+- Treat a result that is not the SDK's `BlockResult` as a classification
+  failure: it is logged with its error type and recorded as `unavailable`
+  instead of being read as an allow.
+- Write the decision's `confidence` and `severity` to
+  `LocalProtectionEventV1` when the Firewall reports a known value, and stop
+  writing `modelScore` and `modelThreshold`. The schema version and every other
+  field are unchanged; app versions that predate the new fields ignore them.
+- Log `action` and `source` in `sdk_result` lines in place of `prediction`.
+- Serve `/v2/classify` and `/classify` from the native acceptance classifier
+  and relay each route to the matching customer route.
+
+This entry describes source prepared for 0.7.0. It does not assert package or
+GitHub publication, hosted propagation, deployment, or installed uptake.
+
 ## 0.6.7 - Source candidate
 
 - Register stable Hermes 0.23.1 `pre_auxiliary_call` and
