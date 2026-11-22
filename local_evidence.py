@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ LOCAL_PROTECTION_EVENT_SCHEMA_VERSION = 1
 PROVENANCE_SCHEMA_VERSION = 1
 MAX_LOCAL_PROTECTION_EVENT_BYTES = 16 * 1024
 MAX_SUMMARY_LENGTH = 280
+MAX_PROVENANCE_BYTES = 128
 DEFAULT_EVENT_DIRECTORY_COMPONENTS = (
     "Library",
     "Application Support",
@@ -35,6 +37,7 @@ DEFAULT_EVENT_DIRECTORY_COMPONENTS = (
 )
 _CONFIDENCE_LEVELS = frozenset({"very_low", "low", "medium", "high", "very_high"})
 _SEVERITY_LEVELS = frozenset({"minimal", "low", "moderate", "high", "critical"})
+_UNSAFE_PROVENANCE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 _SAFE_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._:/-]{0,63}$")
 _RUNTIME_CHECK_MARKER = re.compile(
@@ -135,29 +138,33 @@ def build_local_protection_event(
         },
     }
 
-    decision_evidence = (
-        {}
-        if classification is None
-        else {
+    decision_evidence: dict[str, Any] = {}
+    provenance_versions: dict[str, Any] = {}
+    if classification is not None:
+        governance = classification.governance
+        decision_evidence = {
             "confidence": _known_level(classification.confidence, _CONFIDENCE_LEVELS),
             "severity": _known_level(classification.severity, _SEVERITY_LEVELS),
         }
-    )
-    optional_fields = {
-        "requestFingerprint": request_fingerprint,
-        "sessionFingerprint": session_fingerprint,
-        "toolDisplayName": tool_display_name,
-        "riskClass": consequence["category"],
-        **decision_evidence,
-        "warnDelivery": warn_delivery,
-        "blockUnavailable": True if block_unavailable else None,
-    }
-    local_event.update(
-        {
-            key: value
-            for key, value in optional_fields.items()
-            if value is not None
+        provenance_versions = {
+            "policyVersion": _bounded_provenance(
+                None if governance is None else governance.policy_version
+            ),
+            "modelVersion": _bounded_provenance(classification.model_id),
         }
+    local_event["provenance"].update(_present(provenance_versions))
+    local_event.update(
+        _present(
+            {
+                "requestFingerprint": request_fingerprint,
+                "sessionFingerprint": session_fingerprint,
+                "toolDisplayName": tool_display_name,
+                "riskClass": consequence["category"],
+                **decision_evidence,
+                "warnDelivery": warn_delivery,
+                "blockUnavailable": True if block_unavailable else None,
+            }
+        )
     )
     return local_event
 
@@ -278,6 +285,24 @@ def _prediction(result: BlockResult | None) -> str:
 
 def _known_level(value: Any, levels: frozenset[str]) -> str | None:
     return value if isinstance(value, str) and value in levels else None
+
+
+def _present(fields: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def _bounded_provenance(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(
+        character
+        for character in value
+        if unicodedata.category(character) not in _UNSAFE_PROVENANCE_CATEGORIES
+    ).strip()
+    return (
+        cleaned.encode("utf-8")[:MAX_PROVENANCE_BYTES].decode("utf-8", errors="ignore")
+        or None
+    )
 
 
 def _attempted_consequence(

@@ -230,6 +230,76 @@ class LocalEvidenceTests(unittest.TestCase):
                 self.assertNotIn("modelScore", event)
                 self.assertNotIn("modelThreshold", event)
 
+    def test_provenance_versions_are_bounded_the_way_the_app_ingests_them(self) -> None:
+        def with_model(model_id: object) -> dict[str, object]:
+            return self._event(BlockResult(action="allow", model_id=model_id))["provenance"]
+
+        def with_policy(policy_version: object) -> dict[str, object]:
+            return self._event(
+                BlockResult(
+                    action="allow",
+                    governance=GovernanceDecision(
+                        action="allow",
+                        policy_version=policy_version,
+                    ),
+                )
+            )["provenance"]
+
+        for raw, bounded in (
+            ("  release-7  ", "release-7"),
+            ("re\x00le\tase\x85-7", "release-7"),
+            ("re\u200ble\xadase\ufeff-7", "release-7"),
+            ("\ud83drelease\udc00-7", "release-7"),
+            ("release-\U0001f512", "release-\U0001f512"),
+            ("a" * 128, "a" * 128),
+            ("a" * 129, "a" * 128),
+            ("\xe9" * 65, "\xe9" * 64),
+            ("a" * 127 + "\xe9", "a" * 127),
+            ("a" * 126 + "\U0001f512", "a" * 126),
+        ):
+            with self.subTest(raw=ascii(raw)):
+                self.assertEqual(with_model(raw)["modelVersion"], bounded)
+                self.assertEqual(with_policy(raw)["policyVersion"], bounded)
+                self.assertLessEqual(
+                    len(bounded.encode("utf-8")),
+                    local_evidence.MAX_PROVENANCE_BYTES,
+                )
+        for absent in (None, 7, {}, ["release-7"], "", "   ", "\u200b\x00"):
+            with self.subTest(absent=ascii(absent)):
+                self.assertNotIn("modelVersion", with_model(absent))
+                self.assertNotIn("policyVersion", with_policy(absent))
+        for classification in (BlockResult(action="allow"), None):
+            with self.subTest(classification=classification):
+                provenance = self._event(classification)["provenance"]
+                self.assertNotIn("modelVersion", provenance)
+                self.assertNotIn("policyVersion", provenance)
+
+    def test_bounded_provenance_survives_the_event_writer(self) -> None:
+        event = self._event(
+            BlockResult(
+                action="block",
+                source="governance",
+                model_id="\ud83dmodel\u200b-\U0001f512",
+                governance=GovernanceDecision(
+                    action="block",
+                    policy_version="policy\x00-\xe9",
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = local_evidence.write_local_protection_event(
+                event,
+                {"SILMARIL_LOCAL_EVENT_DIR": directory},
+            )
+            written = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            written["provenance"]["modelVersion"],
+            "model-\U0001f512",
+        )
+        self.assertEqual(written["provenance"]["policyVersion"], "policy-\xe9")
+
     def test_results_without_assessment_omit_confidence_and_severity(self) -> None:
         governance_block = BlockResult(
             action="block",

@@ -17,6 +17,10 @@
   `LocalProtectionEventV1` when the Firewall reports a known value, and stop
   writing `modelScore` and `modelThreshold`. The schema version and every other
   field are unchanged; app versions that predate the new fields ignore them.
+- Record `provenance.modelVersion` from the decision's model identifier and
+  `provenance.policyVersion` from the governance decision's policy version
+  when those are present. Both are stripped of control and format characters
+  and cut to 128 UTF-8 bytes.
 - Log `action` and `source` in `sdk_result` lines in place of `prediction`.
 - Serve `/v2/classify` and `/classify` from the native acceptance classifier
   and relay each route to the matching customer route.

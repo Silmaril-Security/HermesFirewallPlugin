@@ -30,7 +30,14 @@ GOVERNANCE = {
     "rule_id": "synthetic-rule",
 }
 GOVERNANCE_BLOCK_VERSION_2 = {
-    "results": [{"action": "block", "source": "governance", "governance": GOVERNANCE}]
+    "results": [
+        {
+            "action": "block",
+            "source": "governance",
+            "governance": GOVERNANCE,
+            "model_id": "synthetic-model",
+        }
+    ]
 }
 GOVERNANCE_BLOCK_VERSION_1 = {
     "prediction": "BENIGN",
@@ -39,6 +46,7 @@ GOVERNANCE_BLOCK_VERSION_1 = {
     "mode": "shadow",
     "primary_outcome": "benign",
     "governance": GOVERNANCE,
+    "model_id": "synthetic-model",
 }
 DEPLOYMENTS = {
     "version 2 route": {},
@@ -225,6 +233,41 @@ class Sdk100IntegrationTests(unittest.TestCase):
                 self.assertEqual(event["prediction"], "benign")
                 self.assertEqual(event["policyDecision"], "block")
                 self.assertEqual(event["nativeAction"], "block_returned")
+
+    def test_model_and_policy_versions_reach_the_receipt_on_every_deployment_generation(
+        self,
+    ) -> None:
+        deployments = {
+            "version 2 body": {"body": GOVERNANCE_BLOCK_VERSION_2},
+            "/classify fallback": {
+                "body": GOVERNANCE_BLOCK_VERSION_1,
+                "serves_version_2": False,
+            },
+            "version 1 body on /v2/classify": {"body": GOVERNANCE_BLOCK_VERSION_1},
+        }
+        for name, options in deployments.items():
+            with self.subTest(deployment=name), self._deployment(**options):
+                firewall.pre_tool_call(
+                    tool_name="terminal",
+                    args={"command": "synthetic command"},
+                )
+
+                (event,) = self.evidence
+                self.assertEqual(
+                    event["provenance"]["policyVersion"],
+                    GOVERNANCE["policy_version"],
+                )
+                self.assertEqual(event["provenance"]["modelVersion"], "synthetic-model")
+
+        with self._deployment():
+            firewall.pre_tool_call(
+                tool_name="write_file",
+                args={"content": native.RELEASE_SUMMARY},
+            )
+
+            (event,) = self.evidence
+            self.assertNotIn("policyVersion", event["provenance"])
+            self.assertNotIn("modelVersion", event["provenance"])
 
     def test_real_block_results_drive_the_plugin_decision(self) -> None:
         governance = GovernanceDecision(**GOVERNANCE)

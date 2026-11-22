@@ -140,6 +140,11 @@ decision facts, native action, and plugin provenance. The decision's
 `confidence` (`very_low`, `low`, `medium`, `high`, `very_high`) and `severity`
 (`minimal`, `low`, `moderate`, `high`, `critical`) are stored when the Firewall
 reports one of those values; `modelScore` and `modelThreshold` are not written.
+`provenance.modelVersion` records the decision's model identifier when the
+Firewall reports one, and `provenance.policyVersion` records the governance
+decision's policy version when the decision carries governance; neither is
+written otherwise. Both are stripped of control and format characters and cut
+to 128 UTF-8 bytes.
 It never contains raw prompts, arguments, results, assistant output,
 credentials, or error bodies. Events always report `outcome=not_observed`.
 A returned Hermes native veto (`nativeAction=block_returned`) reports
