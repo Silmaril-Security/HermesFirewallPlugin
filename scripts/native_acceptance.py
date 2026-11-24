@@ -383,14 +383,18 @@ def recording_classifier(
     *,
     live: bool,
 ) -> Responder:
+    refused_probe_starts: dict[str, float] = {}
+
     def respond(path: str, headers: Message, payload: dict[str, Any]) -> Reply:
         record: dict[str, Any] = {
             "hook": payload.get("hook"),
             "tool_name": payload.get("tool_name"),
             "authenticated": headers.get("x-api-key") == CLASSIFIER_KEY,
         }
-        records.append(record)
-        started = time.monotonic()
+        logical_event = json.dumps(payload, sort_keys=True)
+        with settled:
+            records.append(record)
+            started = refused_probe_starts.pop(logical_event, time.monotonic())
         route_refusal: int | None = None
         try:
             verdict = classify(path, payload)
@@ -408,6 +412,7 @@ def recording_classifier(
                 )
             else:
                 records[:] = [kept for kept in records if kept is not record]
+                refused_probe_starts[logical_event] = started
             settled.notify_all()
         if route_refusal is not None:
             return Reply(b"{}", status=route_refusal)

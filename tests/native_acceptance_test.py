@@ -335,6 +335,7 @@ def test_live_classifier_passes_a_missing_version_2_route_to_the_sdk(
 
     def fetch(url: str, _body: bytes, _headers: dict[str, str]) -> bytes:
         sent.append(url)
+        time.sleep(0.15)
         if url.endswith(native.V2_ROUTE):
             raise native.UpstreamStatus(status)
         return b'{"prediction": "MALICIOUS"}'
@@ -368,6 +369,7 @@ def test_live_classifier_passes_a_missing_version_2_route_to_the_sdk(
     ]
     assert json.loads(fallback.body) == {"prediction": "MALICIOUS"}
     assert [record["decision"] for record in records] == ["block"]
+    assert records[0]["durationMs"] >= 300
 
 
 @pytest.mark.parametrize(
@@ -390,7 +392,9 @@ def test_live_classifier_reports_other_upstream_statuses_as_bad_gateway(
         live=True,
     )
 
-    assert respond(path, _headers(), {"hook": "user_input", "text": "hello"}).status == 502
+    assert (
+        respond(path, _headers(), {"hook": "user_input", "text": "hello"}).status == 502
+    )
     assert [record["decision"] for record in records] == ["error"]
 
 
@@ -635,7 +639,9 @@ def test_live_pass_does_not_depend_on_the_upstream_mode() -> None:
         live=True,
     )
     respond(
-        native.V1_ROUTE, _headers(), {"hook": "tool_response", "text": native.LIVE_ATTACK}
+        native.V1_ROUTE,
+        _headers(),
+        {"hook": "tool_response", "text": native.LIVE_ATTACK},
     )
 
     result = _evaluate(
