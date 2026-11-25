@@ -1,6 +1,6 @@
 # Hermes Firewall Installed
 
-This fail-open Silmaril SDK firewall plugin, version 0.6.7, is enabled after Hermes restarts.
+This fail-open Silmaril SDK firewall plugin, version 0.7.0, is enabled after Hermes restarts.
 It requires Hermes 0.23.1 or newer.
 
 It classifies `pre_llm_call`, `pre_auxiliary_call`, `post_auxiliary_call`,
@@ -8,8 +8,8 @@ It classifies `pre_llm_call`, `pre_auxiliary_call`, `post_auxiliary_call`,
 `transform_llm_output`, `subagent_start`, and `subagent_stop` with the Silmaril
 Security SDK. SDK output is logged for each call without raw classified text.
 SDK failures are logged and fail open. A
-`FirewallBlockedException` that includes a classification result supplies that
-result for the effective-mode decision and is not treated as an outage. A valid
+`FirewallBlockedException` supplies its typed result for the effective-mode
+decision and is not treated as an outage. A valid
 `SILMARIL_MODE` wins. The deprecated `HERMES_FIREWALL_BLOCK_MALICIOUS` flag is
 consulted only when `SILMARIL_MODE` is absent or blank; a nonempty invalid
 `SILMARIL_MODE` skips the legacy flag. If those rules select no local mode, a
@@ -18,9 +18,9 @@ mode-less response falls back to Shadow without blocking tools, injecting
 context, or rewriting results. Set `SILMARIL_MODE=warn` or
 `SILMARIL_MODE=block` explicitly when that handling is intended.
 The supported local modes are exactly Shadow, Warn, and Block. A result is a
-block candidate when its model prediction is `MALICIOUS` or its typed
-governance decision has `action=block`. A governance-only denial retains its
-benign model prediction and uses readable policy-denial copy.
+block candidate when its `action` is `block`. A block whose `source` is
+`governance` is recorded with a benign model prediction and uses readable
+policy-denial copy.
 
 Hook decisions are also written as private, bounded `LocalProtectionEventV1`
 records under `~/Library/Application Support/Silmaril/Evidence/incoming`.
@@ -53,7 +53,7 @@ SILMARIL_MODE=block
 Install the SDK in the Hermes Python environment:
 
 ```bash
-pip install silmaril-security-sdk==0.8.2
+pip install silmaril-security-sdk==1.0.0
 ```
 
 Set required `SILMARIL_API_KEY` and `SILMARIL_API_URL` in the Hermes

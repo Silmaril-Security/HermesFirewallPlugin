@@ -24,7 +24,11 @@ import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from silmaril_security.sdk import BlockResult, GovernanceContext
 
 try:
     from .local_evidence import (
@@ -40,7 +44,7 @@ except (ImportError, ValueError):
 
 LOGGER = logging.getLogger("hermes.plugins.firewall")
 PLUGIN_NAME = "hermes-firewall"
-PLUGIN_VERSION = "0.6.7"
+PLUGIN_VERSION = "0.7.0"
 CANONICAL_AGENT_ID = "hermes"
 PRE_LLM_BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
 DEFAULT_SDK_TIMEOUT_SECONDS = 2.0
@@ -57,7 +61,7 @@ WARN_CONTEXT = (
 )
 _SDK_CLIENT: Any | None = None
 _SDK_CONFIG: tuple[str, str, float, int, str | None] | None = None
-_TOOL_RESULT_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
+_TOOL_RESULT_CACHE: OrderedDict[str, BlockResult] = OrderedDict()
 _MAX_TOOL_RESULT_CACHE_ENTRIES = 256
 _LOCAL_EVIDENCE_EMITTER = write_local_protection_event
 _MAC_DEVICE_NAME_TIMEOUT_SECONDS = 0.1
@@ -253,30 +257,23 @@ def _configured_mode() -> str | None:
     return "block" if _bool_env("HERMES_FIREWALL_BLOCK_MALICIOUS", False) else "shadow"
 
 
-def _sdk_symbols() -> tuple[Any, Any, Any]:
+def _sdk() -> ModuleType:
     try:
-        from silmaril_security.sdk import Firewall, FirewallBlockedException, HookLabel
+        return importlib.import_module("silmaril_security.sdk")
     except Exception as exc:
         raise RuntimeError(
             "silmaril-security-sdk is not installed or could not be imported"
         ) from exc
-    return Firewall, HookLabel, FirewallBlockedException
 
 
-def _governance_context(hook_name: str, tool_name: str | None) -> Any:
+def _governance_context(hook_name: str, tool_name: str | None) -> GovernanceContext:
     """Build typed SDK governance from canonical and native hook identities."""
-    try:
-        from silmaril_security.sdk import GovernanceContext, GovernanceResource
-    except Exception as exc:
-        raise RuntimeError(
-            "silmaril-security-sdk governance types could not be imported"
-        ) from exc
-
+    sdk = _sdk()
     if hook_name in {"TOOL_CALL", "TOOL_RESPONSE"} and tool_name:
-        resource = GovernanceResource(kind="tool", id=tool_name)
+        resource = sdk.GovernanceResource(kind="tool", id=tool_name)
     else:
-        resource = GovernanceResource(kind="agent", id=CANONICAL_AGENT_ID)
-    return GovernanceContext(agent=CANONICAL_AGENT_ID, resource=resource)
+        resource = sdk.GovernanceResource(kind="agent", id=CANONICAL_AGENT_ID)
+    return sdk.GovernanceContext(agent=CANONICAL_AGENT_ID, resource=resource)
 
 
 def _firewall_client() -> Any:
@@ -296,7 +293,6 @@ def _firewall_client() -> Any:
     if _SDK_CLIENT is not None and _SDK_CONFIG == config:
         return _SDK_CLIENT
 
-    Firewall, _, _ = _sdk_symbols()
     client_options = dict(
         api_key=api_key,
         api_url=api_url,
@@ -305,7 +301,7 @@ def _firewall_client() -> Any:
     )
     if mode is not None:
         client_options["mode"] = mode
-    _SDK_CLIENT = Firewall(**client_options)
+    _SDK_CLIENT = _sdk().Firewall(**client_options)
     _SDK_CONFIG = config
     _TOOL_RESULT_CACHE.clear()
     return _SDK_CLIENT
@@ -314,46 +310,6 @@ def _firewall_client() -> Any:
 def _log(event: str, **fields: Any) -> None:
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     LOGGER.info("[%s] %s %s", PLUGIN_NAME, event, details)
-
-
-def _result_dict(result: Any) -> dict[str, Any]:
-    score = getattr(result, "score", None)
-    threshold = getattr(result, "threshold", None)
-    prediction = getattr(result, "prediction", None)
-    projected = {
-        "prediction": prediction,
-        "score": score,
-        "threshold": threshold,
-        "mode": getattr(result, "mode", None),
-        "governance": _project_governance_decision(result),
-        "primary_outcome": getattr(result, "primary_outcome", None),
-        "outcome_scores": getattr(result, "outcome_scores", None),
-        "detector_scores": getattr(result, "detector_scores", None),
-        "detector_counts": getattr(result, "detector_counts", None),
-    }
-    projected["blocked"] = _is_block_candidate(projected)
-    return projected
-
-
-def _project_governance_decision(result: Any) -> dict[str, str | None] | None:
-    """Project only the public typed GovernanceDecision fields."""
-    decision = getattr(result, "governance", None)
-    if decision is None:
-        return None
-    action = getattr(decision, "action", None)
-    policy_version = getattr(decision, "policy_version", None)
-    rule_id = getattr(decision, "rule_id", None)
-    if action not in {"allow", "block"}:
-        return None
-    if not isinstance(policy_version, str) or not policy_version:
-        return None
-    if rule_id is not None and not isinstance(rule_id, str):
-        return None
-    return {
-        "action": action,
-        "policy_version": policy_version,
-        "rule_id": rule_id,
-    }
 
 
 def _text_for_classification(value: Any) -> str:
@@ -571,7 +527,7 @@ def _classify(
     tool_name: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     original_text: str | None = None,
-) -> dict[str, Any] | None:
+) -> BlockResult | None:
     if not text or not text.strip():
         _log("classify_skipped", hook_event=event, hook=hook_name, reason="empty_text")
         return None
@@ -580,8 +536,8 @@ def _classify(
         full_text = text if original_text is None else original_text
         submitted_text = _bound_text(text, _max_payload_chars())
         client = _firewall_client()
-        _, HookLabel, FirewallBlockedException = _sdk_symbols()
-        hook = getattr(HookLabel, hook_name)
+        sdk = _sdk()
+        hook = getattr(sdk.HookLabel, hook_name)
         classify_options = {
             "hook": hook,
             "tool_name": tool_name,
@@ -596,26 +552,28 @@ def _classify(
                 submitted_text,
                 **classify_options,
             )
-        except FirewallBlockedException as exc:
+        except sdk.FirewallBlockedException as exc:
             # The SDK expresses effective Block as an exception. Recover its
             # typed result so this plugin can invoke the host's genuine native
             # veto instead of treating a policy decision as an outage.
-            if exc.result is None:
-                raise
             result = exc.result
-        result_dict = _result_dict(result)
+        if not isinstance(result, sdk.BlockResult):
+            raise TypeError(
+                f"SDK returned {type(result).__name__} instead of BlockResult"
+            )
         LOGGER.info(
-            "[%s] sdk_result event=%s hook=%s tool_name=%s tool_call_id=%s prediction=%s risk=%s blocked=%s",
+            "[%s] sdk_result event=%s hook=%s tool_name=%s tool_call_id=%s action=%s source=%s risk=%s blocked=%s",
             PLUGIN_NAME,
             event,
             hook.value,
             tool_name or "-",
             (metadata or {}).get("toolCallId") or "-",
-            result_dict.get("prediction"),
-            _risk_label(result_dict),
-            result_dict.get("blocked"),
+            result.action,
+            result.source or "-",
+            _risk_label(result),
+            result.blocked,
         )
-        return result_dict
+        return result
     except Exception as exc:
         LOGGER.warning(
             "[%s] SDK classification failed open event=%s hook=%s tool_name=%s error_type=%s",
@@ -636,7 +594,7 @@ def _observe(
     text: str,
     tool_name: str | None = None,
     original_text: str | None = None,
-) -> dict[str, Any] | None:
+) -> BlockResult | None:
     _log(event, **fields)
     return _classify(
         event,
@@ -648,36 +606,20 @@ def _observe(
     )
 
 
-def _is_model_malicious(result: Mapping[str, Any] | None) -> bool:
-    return result is not None and result.get("prediction") == "MALICIOUS"
-
-
-def _is_governance_block(result: Mapping[str, Any] | None) -> bool:
-    if result is None:
-        return False
-    governance = result.get("governance")
-    return isinstance(governance, Mapping) and governance.get("action") == "block"
-
-
-def _is_block_candidate(result: Mapping[str, Any] | None) -> bool:
-    """Return the single candidate decision used by every plugin boundary."""
-    return _is_model_malicious(result) or _is_governance_block(result)
-
-
-def _effective_mode(result: Mapping[str, Any] | None) -> str:
+def _effective_mode(result: BlockResult | None) -> str:
     configured = _configured_mode()
     if configured is not None:
         # A configured mode is the per-request override. Keep it authoritative
         # across legacy or mixed-version backend responses.
         return configured
-    returned = result.get("mode") if result is not None else None
+    returned = result.mode if result is not None else None
     if returned in {"shadow", "warn", "block"}:
         return str(returned)
     return "shadow"
 
 
 def _local_evidence_decision(
-    result: Mapping[str, Any] | None,
+    result: BlockResult | None,
     *,
     block_action: str | None = None,
     warn_action: str | None = None,
@@ -688,7 +630,7 @@ def _local_evidence_decision(
     block_unavailable = False
     if result is None:
         policy_decision = "unavailable"
-    elif _is_block_candidate(result):
+    elif result.blocked:
         if mode == "block" and block_action is not None:
             policy_decision = "block"
         elif mode == "warn" and warn_action is not None:
@@ -718,7 +660,7 @@ def _record_local_evidence(
     hook: str,
     raw_text: str,
     fields: Mapping[str, Any],
-    result: Mapping[str, Any] | None,
+    result: BlockResult | None,
     mode: str,
     policy_decision: str,
     native_action: str,
@@ -801,7 +743,7 @@ def _tool_result_cache_key(fields: Mapping[str, Any], result: str) -> str:
     return hashlib.sha256(logical_result.encode("utf-8")).hexdigest()
 
 
-def _cached_tool_result(key: str) -> tuple[bool, dict[str, Any] | None]:
+def _cached_tool_result(key: str) -> tuple[bool, BlockResult | None]:
     if key not in _TOOL_RESULT_CACHE:
         return False, None
     value = _TOOL_RESULT_CACHE[key]
@@ -809,7 +751,7 @@ def _cached_tool_result(key: str) -> tuple[bool, dict[str, Any] | None]:
     return True, value
 
 
-def _store_tool_result(key: str, value: dict[str, Any] | None) -> None:
+def _store_tool_result(key: str, value: BlockResult | None) -> None:
     if value is None:
         return
     _TOOL_RESULT_CACHE[key] = value
@@ -818,7 +760,7 @@ def _store_tool_result(key: str, value: dict[str, Any] | None) -> None:
         _TOOL_RESULT_CACHE.popitem(last=False)
 
 
-def _block_message(result: Mapping[str, Any], subject: str) -> str:
+def _block_message(result: BlockResult, subject: str) -> str:
     risk = _risk_label(result)
     return (
         f"Silmaril Firewall blocked this {subject}: {risk}. "
@@ -826,17 +768,18 @@ def _block_message(result: Mapping[str, Any], subject: str) -> str:
     )
 
 
-def _risk_label(result: Mapping[str, Any]) -> str:
-    candidate = _is_block_candidate(result)
-    if _is_governance_block(result) and not _is_model_malicious(result):
+def _risk_label(result: BlockResult) -> str:
+    if not result.blocked:
+        return "No flagged risk"
+    if result.source == "governance":
         return "Governance policy denied this action"
-    outcome = result.get("primary_outcome")
+    outcome = result.outcome
     normalized = outcome.strip().lower() if isinstance(outcome, str) else ""
     normalized = normalized.replace("-", "_").replace(" ", "_")
     if not normalized:
-        return "Unsafe content" if candidate else "No flagged risk"
+        return "Unsafe content"
     if normalized == "benign":
-        return "Unexpected classification conflict" if candidate else "No flagged risk"
+        return "Unexpected classification conflict"
     labels = {
         "prompt_injection": "Unsafe agent control attempt",
         "control_abuse": "Unsafe agent control attempt",
@@ -849,7 +792,7 @@ def _risk_label(result: Mapping[str, Any]) -> str:
     label = labels.get(normalized)
     if label is None:
         LOGGER.debug(
-            "[%s] unknown primary_outcome=%r; using generic risk label",
+            "[%s] unknown outcome=%r; using generic risk label",
             PLUGIN_NAME,
             outcome,
         )
@@ -857,7 +800,7 @@ def _risk_label(result: Mapping[str, Any]) -> str:
     return label
 
 
-def _block_output(result: Mapping[str, Any]) -> dict[str, str]:
+def _block_output(result: BlockResult) -> dict[str, str]:
     return {
         "action": "block",
         "message": _block_message(result, "tool call"),

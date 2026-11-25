@@ -6,7 +6,8 @@ Run from the repository root with the pinned host binary::
 
 The repository tree is packed, installed with ``hermes plugins install``, and
 exercised through ``hermes -z`` against a loopback scripted model and a
-loopback Cascade ``/classify`` endpoint reached through the real SDK.
+loopback Cascade endpoint reached through the real SDK, which serves
+``/v2/classify`` with a version 2 body and ``/classify`` with a version 1 body.
 
 ``NATIVE_ACCEPTANCE_SOURCE`` names an unpacked source tree to install instead of
 the repository (used by ``scripts/customer-published-acceptance``).
@@ -34,7 +35,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import firewall
 
@@ -81,9 +82,19 @@ PLUGIN_DEADLINE_MS = firewall.DEFAULT_SDK_TIMEOUT_SECONDS * 1000
 LIVE_TIMEOUT_SECONDS = 10
 SETTLE_TIMEOUT_SECONDS = 3 * LIVE_TIMEOUT_SECONDS
 HOST_TIMEOUT_SECONDS = 300
+V2_ROUTE = "/v2/classify"
+V1_ROUTE = "/classify"
+ROUTE_FALLBACK_STATUSES = frozenset({403, 404, 405})
 
-Responder = Callable[[Message, dict[str, Any]], "Reply"]
+Responder = Callable[[str, Message, dict[str, Any]], "Reply"]
 Fetch = Callable[[str, bytes, Mapping[str, str]], bytes]
+Classify = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+
+
+class UpstreamStatus(ValueError):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"Unexpected classifier HTTP status {status}")
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -155,7 +166,7 @@ class _LoopbackHandler(BaseHTTPRequestHandler):
         payload = json.loads(
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
         )
-        reply = self.respond(self.headers, payload)
+        reply = self.respond(self.path, self.headers, payload)
         self.send_response(reply.status)
         self.send_header("Content-Type", reply.content_type)
         self.send_header("Content-Length", str(len(reply.body)))
@@ -218,7 +229,7 @@ def scripted_provider(
     requests: list[dict[str, Any]],
     reply: Callable[[dict[str, Any]], Mapping[str, Any]],
 ) -> Responder:
-    def respond(_headers: Message, request: dict[str, Any]) -> Reply:
+    def respond(_path: str, _headers: Message, request: dict[str, Any]) -> Reply:
         if "messages" not in request:
             return Reply(b"{}", status=404)
         requests.append(request)
@@ -256,12 +267,26 @@ def scripted_reply(
     }
 
 
-def loopback_classification(payload: Mapping[str, Any]) -> dict[str, Any]:
+def loopback_classification(path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     hook = payload.get("hook")
     text = str(payload.get("text", ""))
     block = (hook == "tool_call" and PRE_TOOL_BLOCK_MARKER in text) or (
         hook == "tool_response" and LOOPBACK_POISON in text
     )
+    if path == V2_ROUTE:
+        return {
+            "results": [
+                {
+                    "action": "block" if block else "allow",
+                    "source": "model" if block else None,
+                    "confidence": "very_high" if block else None,
+                    "severity": "high" if block else None,
+                    "outcome": "control_abuse" if block else None,
+                    "governance": None,
+                    "model_id": None,
+                }
+            ]
+        }
     return {
         "prediction": "MALICIOUS" if block else "BENIGN",
         "score": 0.99 if block else 0.01,
@@ -288,9 +313,7 @@ def live_classifier(environ: Mapping[str, str]):
                 timeout=LIVE_TIMEOUT_SECONDS,
             ) as response:
                 if not 200 <= response.status_code < 300:
-                    raise ValueError(
-                        f"Unexpected classifier HTTP status {response.status_code}"
-                    )
+                    raise UpstreamStatus(response.status_code)
                 return response.content
 
         yield functools.partial(live_classification, fetch, url, key)
@@ -300,18 +323,47 @@ def live_classification(
     fetch: Fetch,
     url: str,
     api_key: str,
+    path: str,
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     verdict = json.loads(
         fetch(
-            url,
+            upstream_route(url, path),
             json.dumps(payload).encode(),
             {"content-type": "application/json", "x-api-key": api_key},
         )
     )
+    _blocks(verdict)
+    return verdict
+
+
+def upstream_route(url: str, path: str) -> str:
+    configured = urlsplit(url)
+    base = configured.path.removesuffix("/")
+    for route in (V2_ROUTE, V1_ROUTE):
+        if base.endswith(route):
+            base = base.removesuffix(route)
+            break
+    return urlunsplit(configured._replace(path=base + path))
+
+
+def _blocks(verdict: Mapping[str, Any]) -> bool:
+    if "results" in verdict:
+        results = verdict["results"]
+        if (
+            not isinstance(results, list)
+            or len(results) != 1
+            or not isinstance(results[0], Mapping)
+            or not isinstance(results[0].get("action"), str)
+        ):
+            raise ValueError("live classifier returned no action")
+        return results[0]["action"] != "allow"
     if verdict.get("prediction") not in {"BENIGN", "MALICIOUS"}:
         raise ValueError("live classifier returned no prediction")
-    return verdict
+    return (
+        verdict["prediction"] == "MALICIOUS"
+        or (verdict.get("governance") or {}).get("action") == "block"
+    )
 
 
 def live_settings(environ: Mapping[str, str]) -> tuple[str, str]:
@@ -326,29 +378,44 @@ def live_settings(environ: Mapping[str, str]) -> tuple[str, str]:
 
 def recording_classifier(
     records: list[dict[str, Any]],
-    classify: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    classify: Classify,
     settled: threading.Condition,
     *,
     live: bool,
 ) -> Responder:
-    def respond(headers: Message, payload: dict[str, Any]) -> Reply:
+    refused_probe_starts: dict[str, float] = {}
+
+    def respond(path: str, headers: Message, payload: dict[str, Any]) -> Reply:
         record: dict[str, Any] = {
             "hook": payload.get("hook"),
             "tool_name": payload.get("tool_name"),
             "authenticated": headers.get("x-api-key") == CLASSIFIER_KEY,
         }
-        records.append(record)
-        started = time.monotonic()
+        logical_event = json.dumps(payload, sort_keys=True)
+        with settled:
+            records.append(record)
+            started = refused_probe_starts.pop(logical_event, time.monotonic())
+        route_refusal: int | None = None
         try:
-            verdict = classify(payload)
+            verdict = classify(path, payload)
+        except UpstreamStatus as refusal:
+            verdict = None
+            if path == V2_ROUTE and refusal.status in ROUTE_FALLBACK_STATUSES:
+                route_refusal = refusal.status
         except (OSError, ValueError, HTTPException):
             verdict = None
         with settled:
-            record.update(
-                _outcome(verdict, live=live),
-                durationMs=round((time.monotonic() - started) * 1000),
-            )
+            if route_refusal is None:
+                record.update(
+                    _outcome(verdict, live=live),
+                    durationMs=round((time.monotonic() - started) * 1000),
+                )
+            else:
+                records[:] = [kept for kept in records if kept is not record]
+                refused_probe_starts[logical_event] = started
             settled.notify_all()
+        if route_refusal is not None:
+            return Reply(b"{}", status=route_refusal)
         if verdict is None:
             return Reply(b"{}", status=502)
         return Reply(json.dumps(verdict).encode())
@@ -359,15 +426,17 @@ def recording_classifier(
 def _outcome(verdict: Mapping[str, Any] | None, *, live: bool) -> dict[str, Any]:
     if verdict is None:
         return {"decision": "error"}
-    action = (verdict.get("governance") or {}).get("action")
-    block = verdict["prediction"] == "MALICIOUS" or action == "block"
-    upstream = {
-        "prediction": verdict["prediction"],
-        "mode": verdict.get("mode"),
-        "action": action,
-    }
+    if "results" in verdict:
+        result = verdict["results"][0]
+        upstream = {"action": result["action"], "source": result.get("source")}
+    else:
+        upstream = {
+            "prediction": verdict["prediction"],
+            "mode": verdict.get("mode"),
+            "action": (verdict.get("governance") or {}).get("action"),
+        }
     return {
-        "decision": "block" if block else "allow",
+        "decision": "block" if _blocks(verdict) else "allow",
         **({"upstream": upstream} if live else {}),
     }
 
@@ -678,7 +747,7 @@ def managed_runtime(hermes_home: Path) -> tuple[Path, Path]:
 def accept(
     evidence: Evidence,
     scenarios: Sequence[Scenario],
-    classify: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    classify: Classify,
     poison: str,
     hermes_bin: str,
     root: Path,

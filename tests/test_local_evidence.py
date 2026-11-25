@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from silmaril_security.sdk import BlockResult, GovernanceDecision
+
 import local_evidence
 
 
@@ -17,7 +19,6 @@ class LocalEvidenceTests(unittest.TestCase):
     def test_builds_frozen_schema_with_bounded_redacted_metadata(self) -> None:
         raw_secret = "RAW-PAYLOAD secret-password-123"
         session_secret = "customer-session-secret-456"
-        detector_secret = "detector-debug-secret-789"
 
         event = local_evidence.build_local_protection_event(
             event="pre_tool_call",
@@ -30,13 +31,13 @@ class LocalEvidenceTests(unittest.TestCase):
                 "tool_call_id": "tool-call-456",
                 "tool_name": "api_key=secret-value",
             },
-            classification={
-                "prediction": "MALICIOUS",
-                "score": 0.97,
-                "threshold": 0.8,
-                "primary_outcome": "secret_exposure",
-                "detector_scores": {"raw": detector_secret},
-            },
+            classification=BlockResult(
+                action="block",
+                source="model",
+                confidence="very_high",
+                severity="critical",
+                outcome="secret_exposure",
+            ),
             policy_decision="block",
             native_action="block_returned",
             plugin_name="hermes-firewall",
@@ -59,8 +60,8 @@ class LocalEvidenceTests(unittest.TestCase):
                 "riskClass",
                 "attemptedConsequence",
                 "prediction",
-                "modelScore",
-                "modelThreshold",
+                "confidence",
+                "severity",
                 "policyDecision",
                 "nativeAction",
                 "outcome",
@@ -84,8 +85,8 @@ class LocalEvidenceTests(unittest.TestCase):
             "summary": "A credential or secret could be exposed.",
         })
         self.assertEqual(event["prediction"], "malicious")
-        self.assertEqual(event["modelScore"], 0.97)
-        self.assertEqual(event["modelThreshold"], 0.8)
+        self.assertEqual(event["confidence"], "very_high")
+        self.assertEqual(event["severity"], "critical")
         self.assertEqual(event["policyDecision"], "block")
         self.assertEqual(event["nativeAction"], "block_returned")
         self.assertEqual(event["outcome"], "not_observed")
@@ -106,7 +107,6 @@ class LocalEvidenceTests(unittest.TestCase):
             "task-123",
             "tool-call-456",
             "secret-value",
-            detector_secret,
         ):
             self.assertNotIn(secret, serialized)
         self.assertLess(
@@ -125,10 +125,7 @@ class LocalEvidenceTests(unittest.TestCase):
             mode="shadow",
             raw_text=f"Reply with OK only. {marker}",
             fields={},
-            classification={
-                "prediction": "BENIGN",
-                "primary_outcome": "benign",
-            },
+            classification=BlockResult(action="allow"),
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",
@@ -147,10 +144,7 @@ class LocalEvidenceTests(unittest.TestCase):
             "hook": "user_input",
             "mode": "shadow",
             "raw_text": "bounded request",
-            "classification": {
-                "prediction": "BENIGN",
-                "primary_outcome": "benign",
-            },
+            "classification": BlockResult(action="allow"),
             "policy_decision": "allow",
             "native_action": "none",
             "plugin_name": "hermes-firewall",
@@ -196,31 +190,138 @@ class LocalEvidenceTests(unittest.TestCase):
         ):
             self.assertNotIn(raw_id, serialized)
 
-    def test_prediction_scores_and_unknown_consequences_are_conservative(self) -> None:
-        event = local_evidence.build_local_protection_event(
-            event="transform_llm_output",
-            hook="llm_output",
-            mode="shadow",
-            raw_text="safe output",
-            fields={},
-            classification={
-                "prediction": "BENIGN",
-                "score": float("nan"),
-                "threshold": 2,
-                "primary_outcome": "server_future_value",
-            },
-            policy_decision="allow",
-            native_action="allowed",
-            plugin_name="hermes-firewall",
-            plugin_version="0.6.0",
-            occurred_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
+    def test_unknown_levels_and_consequences_are_conservative(self) -> None:
+        event = self._event(
+            BlockResult(
+                action="block",
+                source="model",
+                confidence="server_future_value",
+                severity=["server_future_value"],
+                outcome="server_future_value",
+            )
         )
 
-        self.assertEqual(event["prediction"], "benign")
-        self.assertEqual(event["riskClass"], "unknown")
-        self.assertNotIn("modelScore", event)
-        self.assertNotIn("modelThreshold", event)
+        self.assertEqual(event["prediction"], "malicious")
+        self.assertEqual(event["riskClass"], "other")
+        self.assertNotIn("confidence", event)
+        self.assertNotIn("severity", event)
         self.assertNotIn("server_future_value", json.dumps(event))
+
+    def test_every_receipt_level_is_written_and_scores_never_are(self) -> None:
+        for confidence, severity in (
+            ("very_low", "minimal"),
+            ("low", "low"),
+            ("medium", "moderate"),
+            ("high", "high"),
+            ("very_high", "critical"),
+        ):
+            with self.subTest(confidence=confidence, severity=severity):
+                event = self._event(
+                    BlockResult(
+                        action="block",
+                        source="model",
+                        confidence=confidence,
+                        severity=severity,
+                    )
+                )
+
+                self.assertEqual(event["confidence"], confidence)
+                self.assertEqual(event["severity"], severity)
+                self.assertNotIn("modelScore", event)
+                self.assertNotIn("modelThreshold", event)
+
+    def test_provenance_versions_are_bounded_the_way_the_app_ingests_them(self) -> None:
+        def with_model(model_id: object) -> dict[str, object]:
+            return self._event(BlockResult(action="allow", model_id=model_id))["provenance"]
+
+        def with_policy(policy_version: object) -> dict[str, object]:
+            return self._event(
+                BlockResult(
+                    action="allow",
+                    governance=GovernanceDecision(
+                        action="allow",
+                        policy_version=policy_version,
+                    ),
+                )
+            )["provenance"]
+
+        for raw, bounded in (
+            ("  release-7  ", "release-7"),
+            ("re\x00le\tase\x85-7", "release-7"),
+            ("re\u200ble\xadase\ufeff-7", "release-7"),
+            ("\ud83drelease\udc00-7", "release-7"),
+            ("release-\U0001f512", "release-\U0001f512"),
+            ("a" * 128, "a" * 128),
+            ("a" * 129, "a" * 128),
+            ("\xe9" * 65, "\xe9" * 64),
+            ("a" * 127 + "\xe9", "a" * 127),
+            ("a" * 126 + "\U0001f512", "a" * 126),
+        ):
+            with self.subTest(raw=ascii(raw)):
+                self.assertEqual(with_model(raw)["modelVersion"], bounded)
+                self.assertEqual(with_policy(raw)["policyVersion"], bounded)
+                self.assertLessEqual(
+                    len(bounded.encode("utf-8")),
+                    local_evidence.MAX_PROVENANCE_BYTES,
+                )
+        for absent in (None, 7, {}, ["release-7"], "", "   ", "\u200b\x00"):
+            with self.subTest(absent=ascii(absent)):
+                self.assertNotIn("modelVersion", with_model(absent))
+                self.assertNotIn("policyVersion", with_policy(absent))
+        for classification in (BlockResult(action="allow"), None):
+            with self.subTest(classification=classification):
+                provenance = self._event(classification)["provenance"]
+                self.assertNotIn("modelVersion", provenance)
+                self.assertNotIn("policyVersion", provenance)
+
+    def test_bounded_provenance_survives_the_event_writer(self) -> None:
+        event = self._event(
+            BlockResult(
+                action="block",
+                source="governance",
+                model_id="\ud83dmodel\u200b-\U0001f512",
+                governance=GovernanceDecision(
+                    action="block",
+                    policy_version="policy\x00-\xe9",
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = local_evidence.write_local_protection_event(
+                event,
+                {"SILMARIL_LOCAL_EVENT_DIR": directory},
+            )
+            written = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            written["provenance"]["modelVersion"],
+            "model-\U0001f512",
+        )
+        self.assertEqual(written["provenance"]["policyVersion"], "policy-\xe9")
+
+    def test_results_without_assessment_omit_confidence_and_severity(self) -> None:
+        governance_block = BlockResult(
+            action="block",
+            source="governance",
+            governance=GovernanceDecision(
+                action="block",
+                policy_version="synthetic-policy-v1",
+            ),
+        )
+        for classification, prediction in (
+            (BlockResult(action="allow"), "benign"),
+            (governance_block, "benign"),
+            (BlockResult(action="block"), "malicious"),
+            (None, "unavailable"),
+        ):
+            with self.subTest(classification=classification):
+                event = self._event(classification)
+
+                self.assertEqual(event["prediction"], prediction)
+                self.assertEqual(event["schemaVersion"], 1)
+                for absent in ("confidence", "severity", "modelScore", "modelThreshold"):
+                    self.assertNotIn(absent, event)
 
     def test_override_and_application_support_default_are_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,19 +398,17 @@ class LocalEvidenceTests(unittest.TestCase):
             self.assertTrue(destination.is_file())
             self.assertEqual(json.loads(destination.read_text()), event)
 
-    def _event(self) -> dict[str, object]:
+    def _event(
+        self,
+        classification: BlockResult | None = BlockResult(action="allow"),
+    ) -> dict[str, object]:
         return local_evidence.build_local_protection_event(
             event="pre_tool_call",
             hook="pre_tool",
             mode="shadow",
             raw_text="bounded input",
             fields={"tool_call_id": "call-1", "tool_name": "terminal"},
-            classification={
-                "prediction": "BENIGN",
-                "score": 0.01,
-                "threshold": 0.5,
-                "primary_outcome": "benign",
-            },
+            classification=classification,
             policy_decision="allow",
             native_action="allowed",
             plugin_name="hermes-firewall",

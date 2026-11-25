@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from silmaril_security.sdk import BlockResult, GovernanceDecision
+
 import firewall
 import local_evidence
 
@@ -34,6 +36,37 @@ ENV_KEYS = {
     "SILMARIL_DEMO_BASE_URL",
 }
 TEST_EVIDENCE_DIRECTORIES: list[str] = []
+REAL_SDK_MODULES = {
+    name: sys.modules[name] for name in ("silmaril_security", "silmaril_security.sdk")
+}
+ALLOW = BlockResult(action="allow", mode="shadow")
+MODEL_BLOCK = BlockResult(
+    action="block",
+    source="model",
+    confidence="very_high",
+    severity="high",
+    outcome="control_abuse",
+    mode="shadow",
+)
+GOVERNANCE_BLOCK = BlockResult(
+    action="block",
+    source="governance",
+    governance=GovernanceDecision(
+        action="block",
+        policy_version="synthetic-policy-v1",
+        rule_id="synthetic-rule",
+    ),
+    mode="shadow",
+)
+GOVERNANCE_ALLOW = BlockResult(
+    action="allow",
+    governance=GovernanceDecision(
+        action="allow",
+        policy_version="synthetic-policy-v1",
+        rule_id="synthetic-rule",
+    ),
+    mode="shadow",
+)
 
 
 @dataclass(frozen=True)
@@ -61,28 +94,8 @@ class FakeGovernanceContext:
     resource: FakeGovernanceResource
 
 
-@dataclass(frozen=True)
-class FakeGovernanceDecision:
-    action: str
-    policy_version: str = "synthetic-policy-v1"
-    rule_id: str | None = "synthetic-rule"
-
-
-@dataclass(frozen=True)
-class FakeResult:
-    prediction: str = "BENIGN"
-    score: float = 0.01
-    threshold: float = 0.5
-    primary_outcome: str | None = "benign"
-    outcome_scores: dict[str, float] | None = None
-    detector_scores: dict[str, float] | None = None
-    detector_counts: dict[str, int] | None = None
-    mode: str | None = "shadow"
-    governance: FakeGovernanceDecision | None = None
-
-
 class FakeFirewallBlockedException(Exception):
-    def __init__(self, result: FakeResult | None) -> None:
+    def __init__(self, result: BlockResult | None) -> None:
         self.result = result
         super().__init__("blocked")
 
@@ -90,25 +103,22 @@ class FakeFirewallBlockedException(Exception):
 class FakeFirewall:
     instances: list[dict[str, Any]] = []
     calls: list[dict[str, Any]] = []
-    next_result: FakeResult = FakeResult()
+    next_result: Any = ALLOW
     error: Exception | None = None
 
     def __init__(self, **options: Any) -> None:
         self.options = options
         self.instances.append(options)
 
-    def classify(self, text: str, **options: Any) -> FakeResult:
+    def classify(self, text: str, **options: Any) -> Any:
         self.calls.append({"text": text, "options": options})
         if self.error is not None:
             raise self.error
+        if not isinstance(self.next_result, BlockResult):
+            return self.next_result
         requested_mode = self.options.get("mode")
         result = replace(self.next_result, mode=requested_mode or self.next_result.mode)
-        effective_mode = requested_mode or result.mode or "block"
-        governance_block = (
-            result.governance is not None
-            and result.governance.action == "block"
-        )
-        if (result.prediction == "MALICIOUS" or governance_block) and effective_mode == "block":
+        if result.blocked and (requested_mode or result.mode or "block") == "block":
             raise FakeFirewallBlockedException(result)
         return result
 
@@ -151,6 +161,7 @@ class OldHostContext:
 def install_fake_sdk() -> None:
     package = types.ModuleType("silmaril_security")
     sdk = types.ModuleType("silmaril_security.sdk")
+    sdk.BlockResult = BlockResult
     sdk.Firewall = FakeFirewall
     sdk.FirewallBlockedException = FakeFirewallBlockedException
     sdk.GovernanceContext = FakeGovernanceContext
@@ -194,7 +205,7 @@ def reset_state(**env: str) -> None:
     firewall._TOOL_RESULT_CACHE.clear()
     FakeFirewall.instances = []
     FakeFirewall.calls = []
-    FakeFirewall.next_result = FakeResult()
+    FakeFirewall.next_result = ALLOW
     FakeFirewall.error = None
     for key in ENV_KEYS:
         os.environ.pop(key, None)
@@ -229,11 +240,9 @@ class HermesFirewallTests(unittest.TestCase):
         firewall._TOOL_RESULT_CACHE.clear()
         FakeFirewall.instances = []
         FakeFirewall.calls = []
-        FakeFirewall.next_result = FakeResult()
+        FakeFirewall.next_result = ALLOW
         FakeFirewall.error = None
-        if getattr(sys.modules.get("silmaril_security.sdk"), "Firewall", None) is FakeFirewall:
-            sys.modules.pop("silmaril_security.sdk", None)
-            sys.modules.pop("silmaril_security", None)
+        sys.modules.update(REAL_SDK_MODULES)
         for directory in TEST_EVIDENCE_DIRECTORIES:
             shutil.rmtree(directory, ignore_errors=True)
         TEST_EVIDENCE_DIRECTORIES.clear()
@@ -377,7 +386,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(pre_tool_metadata["toolCallId"], "tc1")
         self.assertIsNone(pre_tool_metadata["conversationId"])
         self.assertEqual(pre_tool_metadata["silmaril"]["integration"], "hermes-firewall")
-        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.6.7")
+        self.assertEqual(pre_tool_metadata["silmaril"]["version"], "0.7.0")
         self.assertEqual(pre_tool_metadata["silmaril"]["provenance"], {
             "schema_version": 1,
             "harness": "hermes",
@@ -533,12 +542,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_MODE="block",
             HERMES_FIREWALL_MAX_PAYLOAD_CHARS="128",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         evidence: list[dict[str, Any]] = []
         raw_request = "HEAD" + ("x" * 300) + "TAIL"
         raw_response = "RESPONSE-HEAD" + ("y" * 300) + "RESPONSE-TAIL"
@@ -625,12 +629,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="block",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         evidence: list[dict[str, Any]] = []
         secrets = (
             "raw-provider-error credential=error-secret",
@@ -711,12 +710,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="block",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         evidence: list[dict[str, Any]] = []
         secrets = (
             "raw-stream-history credential=history-secret",
@@ -832,16 +826,8 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_native_prompt_veto_blocks_malicious_and_governance_before_inference(self) -> None:
         cases = (
-            FakeResult(
-                prediction="MALICIOUS",
-                score=0.99,
-                primary_outcome="control_abuse",
-            ),
-            FakeResult(
-                prediction="BENIGN",
-                primary_outcome="benign",
-                governance=FakeGovernanceDecision("block"),
-            ),
+            MODEL_BLOCK,
+            GOVERNANCE_BLOCK,
         )
         for result in cases:
             with self.subTest(result=result):
@@ -897,11 +883,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="block",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         evidence: list[dict[str, Any]] = []
 
         with (
@@ -936,7 +918,7 @@ class HermesFirewallTests(unittest.TestCase):
             "silmaril": {
                 "keep": True,
                 "integration": "hermes-firewall",
-                "version": "0.6.7",
+                "version": "0.7.0",
                 "provenance": {
                     "schema_version": 1,
                     "endpoint_id": endpoint_id,
@@ -1153,13 +1135,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-            mode=None,
-        )
+        FakeFirewall.next_result = replace(MODEL_BLOCK, mode=None)
 
         self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"}))
 
@@ -1171,7 +1147,7 @@ class HermesFirewallTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            firewall._effective_mode({"prediction": "MALICIOUS", "mode": "block"}),
+            firewall._effective_mode(replace(MODEL_BLOCK, mode="block")),
             "shadow",
         )
 
@@ -1180,12 +1156,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         tool_args = {"command": "unsafe"}
         original_tool_args = dict(tool_args)
 
@@ -1253,12 +1224,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
 
         blocked = firewall.pre_tool_call(
             tool_name="terminal",
@@ -1292,12 +1258,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
 
         self.assertIsNone(
             firewall.pre_tool_call(
@@ -1323,12 +1284,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         expected_block = firewall.pre_tool_call(
             tool_name="terminal",
             args={"command": "baseline command"},
@@ -1364,12 +1320,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
 
         blocked = firewall.pre_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
         self.assertEqual(blocked["action"], "block")
@@ -1415,16 +1366,8 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_held_stream_delivers_only_fixed_replacement_for_block_candidates(self) -> None:
         cases = (
-            FakeResult(
-                prediction="MALICIOUS",
-                score=0.99,
-                primary_outcome="control_abuse",
-            ),
-            FakeResult(
-                prediction="BENIGN",
-                primary_outcome="benign",
-                governance=FakeGovernanceDecision("block"),
-            ),
+            MODEL_BLOCK,
+            GOVERNANCE_BLOCK,
         )
         for result in cases:
             with self.subTest(result=result):
@@ -1452,26 +1395,18 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_held_stream_preserves_benign_shadow_warn_and_fail_open_content(self) -> None:
         cases = (
-            ("block", FakeResult(), None),
+            ("block", ALLOW, None),
             (
                 "shadow",
-                FakeResult(
-                    prediction="MALICIOUS",
-                    score=0.99,
-                    primary_outcome="control_abuse",
-                ),
+                MODEL_BLOCK,
                 None,
             ),
             (
                 "warn",
-                FakeResult(
-                    prediction="MALICIOUS",
-                    score=0.99,
-                    primary_outcome="control_abuse",
-                ),
+                MODEL_BLOCK,
                 None,
             ),
-            ("block", FakeResult(), TimeoutError("classifier unavailable")),
+            ("block", ALLOW, TimeoutError("classifier unavailable")),
         )
         for mode, result, error in cases:
             with self.subTest(mode=mode, error=error):
@@ -1498,12 +1433,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="warn",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
 
         prompt_result = firewall.pre_llm_call(user_message="raw secret prompt")
         self.assertEqual(prompt_result, {"context": firewall.WARN_CONTEXT})
@@ -1557,12 +1487,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
 
         blocked = firewall.pre_tool_call(
             tool_name=firewall.DELEGATION_TOOL_NAME,
@@ -1617,17 +1542,17 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(FakeFirewall.calls[1]["text"], "unsafe child final")
         self.assertEqual(FakeFirewall.calls[0]["options"]["metadata"]["childSessionId"], "child1")
 
-    def test_optional_enforcement_respects_explicit_benign_prediction(self) -> None:
+    def test_optional_enforcement_respects_an_allow_that_carries_evidence(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="BENIGN",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="benign",
+        FakeFirewall.next_result = replace(
+            MODEL_BLOCK,
+            action="allow",
+            source=None,
+            governance=GOVERNANCE_BLOCK.governance,
         )
 
         self.assertIsNone(
@@ -1640,32 +1565,26 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_governance_candidates_follow_block_warn_shadow_at_transform_hook(self) -> None:
         cases = (
-            ("block", FakeGovernanceDecision("block"), "block"),
-            ("warn", FakeGovernanceDecision("block"), "warn"),
-            ("shadow", FakeGovernanceDecision("block"), "monitor"),
-            ("block", FakeGovernanceDecision("allow"), "allow"),
-            ("warn", FakeGovernanceDecision("allow"), "allow"),
-            ("shadow", FakeGovernanceDecision("allow"), "allow"),
-            ("block", None, "allow"),
-            ("warn", None, "allow"),
-            ("shadow", None, "allow"),
+            ("block", GOVERNANCE_BLOCK, "block"),
+            ("warn", GOVERNANCE_BLOCK, "warn"),
+            ("shadow", GOVERNANCE_BLOCK, "monitor"),
+            ("block", GOVERNANCE_ALLOW, "allow"),
+            ("warn", GOVERNANCE_ALLOW, "allow"),
+            ("shadow", GOVERNANCE_ALLOW, "allow"),
+            ("block", ALLOW, "allow"),
+            ("warn", ALLOW, "allow"),
+            ("shadow", ALLOW, "allow"),
         )
-        for mode, governance, expected_decision in cases:
-            with self.subTest(mode=mode, governance=governance):
+        for mode, result, expected_decision in cases:
+            with self.subTest(mode=mode, result=result):
                 reset_state(
                     SILMARIL_API_KEY="test-key",
                     SILMARIL_API_URL="https://tenant.example/classify",
                     SILMARIL_MODE=mode,
                 )
-                FakeFirewall.next_result = FakeResult(
-                    prediction="BENIGN",
-                    score=0.01,
-                    threshold=0.5,
-                    primary_outcome="benign",
-                    governance=governance,
-                )
+                FakeFirewall.next_result = result
                 evidence: list[dict[str, Any]] = []
-                raw_result = f"synthetic result {mode} {governance}"
+                raw_result = f"synthetic result {mode} {result.action}"
                 with mock.patch.object(
                     firewall,
                     "_LOCAL_EVIDENCE_EMITTER",
@@ -1676,7 +1595,7 @@ class HermesFirewallTests(unittest.TestCase):
                         result=raw_result,
                     )
 
-                if governance is not None and governance.action == "block":
+                if result.blocked:
                     if mode == "block":
                         self.assertNotIn(raw_result, transformed)
                         self.assertIn("Governance policy denied this action", transformed)
@@ -1698,13 +1617,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="block",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="BENIGN",
-            score=0.01,
-            threshold=0.5,
-            primary_outcome="benign",
-            governance=FakeGovernanceDecision("block"),
-        )
+        FakeFirewall.next_result = GOVERNANCE_BLOCK
         evidence: list[dict[str, Any]] = []
         with mock.patch.object(
             firewall,
@@ -1729,7 +1642,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(evidence[0]["policyDecision"], "block")
         self.assertEqual(evidence[0]["nativeAction"], "block_returned")
         rendered_logs = "\n".join(logs.output)
-        self.assertIn("prediction=BENIGN", rendered_logs)
+        self.assertIn("action=block source=governance", rendered_logs)
         self.assertIn("risk=Governance policy denied this action", rendered_logs)
         self.assertIn("blocked=True", rendered_logs)
         self.assertNotIn("synthetic-policy-v1", rendered_logs)
@@ -1741,11 +1654,7 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             SILMARIL_MODE="block",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="BENIGN",
-            primary_outcome="benign",
-            governance=FakeGovernanceDecision("block"),
-        )
+        FakeFirewall.next_result = GOVERNANCE_BLOCK
 
         self.assertIsNone(firewall.post_tool_call(
             tool_name="terminal",
@@ -1764,33 +1673,142 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("synthetic result", transformed)
         self.assertIn("Governance policy denied this action", transformed)
 
-    def test_result_projection_keeps_only_typed_governance_fields(self) -> None:
-        projected = firewall._result_dict(FakeResult(
-            governance=FakeGovernanceDecision("block"),
-        ))
+    def test_every_blocking_result_is_enforced_at_every_native_boundary(self) -> None:
+        raw = "synthetic blocked content"
+        for result in (MODEL_BLOCK, GOVERNANCE_BLOCK, BlockResult(action="block")):
+            with self.subTest(result=result):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE="block",
+                )
+                FakeFirewall.next_result = result
+                evidence: list[dict[str, Any]] = []
 
-        self.assertEqual(projected["governance"], {
-            "action": "block",
-            "policy_version": "synthetic-policy-v1",
-            "rule_id": "synthetic-rule",
-        })
-        self.assertTrue(projected["blocked"])
+                with (
+                    native_prompt_veto_capability(),
+                    mock.patch.object(
+                        firewall,
+                        "_LOCAL_EVIDENCE_EMITTER",
+                        side_effect=evidence.append,
+                    ),
+                ):
+                    prompt = firewall.pre_llm_call(user_message=raw)
+                    tool_call = firewall.pre_tool_call(
+                        tool_name="terminal",
+                        args={"command": raw},
+                    )
+                    tool_result = firewall.transform_tool_result(
+                        tool_name="terminal",
+                        result=raw,
+                    )
+                    output = firewall.transform_llm_output(response_text=raw)
 
-    def test_unknown_missing_and_score_only_results_fail_open(self) -> None:
-        self.assertFalse(firewall._is_block_candidate(None))
-        self.assertFalse(firewall._is_block_candidate({}))
-        self.assertFalse(firewall._is_block_candidate({"prediction": "UNKNOWN", "score": 1.0}))
-        self.assertFalse(firewall._is_block_candidate({"prediction": "malicious", "blocked": True}))
-        self.assertFalse(firewall._is_block_candidate({"prediction": "BENIGN", "score": 1.0}))
-        self.assertFalse(firewall._is_block_candidate({
-            "prediction": "BENIGN",
-            "governance": {"action": "allow"},
-        }))
-        self.assertTrue(firewall._is_block_candidate({
-            "prediction": "BENIGN",
-            "governance": {"action": "block"},
-        }))
-        self.assertTrue(firewall._is_block_candidate({"prediction": "MALICIOUS", "score": 0.0}))
+                self.assertEqual(prompt["action"], "block")
+                self.assertEqual(tool_call["action"], "block")
+                for replaced in (prompt["message"], tool_call["message"], tool_result, output):
+                    self.assertIn("Silmaril Firewall blocked this", replaced)
+                    self.assertNotIn(raw, replaced)
+                self.assertEqual(
+                    [event["policyDecision"] for event in evidence],
+                    ["block", "block", "block", "block"],
+                )
+                self.assertEqual(
+                    [event["nativeAction"] for event in evidence],
+                    ["block_returned", "block_returned", "content_replaced", "content_replaced"],
+                )
+
+    def test_allow_results_pass_every_native_boundary_unchanged(self) -> None:
+        raw = "synthetic allowed content"
+        for result in (ALLOW, GOVERNANCE_ALLOW, replace(MODEL_BLOCK, action="allow")):
+            with self.subTest(result=result):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE="block",
+                )
+                FakeFirewall.next_result = result
+
+                with native_prompt_veto_capability():
+                    self.assertIsNone(firewall.pre_llm_call(user_message=raw))
+                    self.assertIsNone(
+                        firewall.pre_tool_call(tool_name="terminal", args={"command": raw})
+                    )
+                    self.assertEqual(
+                        firewall.transform_tool_result(tool_name="terminal", result=raw),
+                        raw,
+                    )
+                    self.assertEqual(firewall.transform_llm_output(response_text=raw), raw)
+
+    def test_unexpected_result_types_are_reported_unavailable_never_allowed(self) -> None:
+        stand_ins = (
+            types.SimpleNamespace(action="allow", blocked=False, mode="block"),
+            types.SimpleNamespace(action="block", blocked=True, mode="block"),
+            types.SimpleNamespace(prediction="MALICIOUS", score=0.99, threshold=0.5),
+            {"action": "allow"},
+            None,
+        )
+        for stand_in in stand_ins:
+            with self.subTest(stand_in=stand_in):
+                reset_state(
+                    SILMARIL_API_KEY="test-key",
+                    SILMARIL_API_URL="https://tenant.example/classify",
+                    SILMARIL_MODE="block",
+                )
+                FakeFirewall.next_result = stand_in
+                evidence: list[dict[str, Any]] = []
+
+                with (
+                    mock.patch.object(
+                        firewall,
+                        "_LOCAL_EVIDENCE_EMITTER",
+                        side_effect=evidence.append,
+                    ),
+                    self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs,
+                ):
+                    decision = firewall.pre_tool_call(
+                        tool_name="terminal",
+                        args={"command": "synthetic command"},
+                    )
+
+                self.assertIsNone(decision)
+                self.assertIn("error_type=TypeError", "\n".join(logs.output))
+                self.assertEqual(evidence[0]["policyDecision"], "unavailable")
+                self.assertEqual(evidence[0]["prediction"], "unavailable")
+
+    def test_blocked_exception_without_a_typed_result_is_reported_unavailable(self) -> None:
+        reset_state(
+            SILMARIL_API_KEY="test-key",
+            SILMARIL_API_URL="https://tenant.example/classify",
+            SILMARIL_MODE="block",
+        )
+        FakeFirewall.error = FakeFirewallBlockedException(None)
+        evidence: list[dict[str, Any]] = []
+
+        with (
+            mock.patch.object(
+                firewall,
+                "_LOCAL_EVIDENCE_EMITTER",
+                side_effect=evidence.append,
+            ),
+            self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs,
+        ):
+            decision = firewall.pre_tool_call(
+                tool_name="terminal",
+                args={"command": "synthetic command"},
+            )
+
+        self.assertIsNone(decision)
+        self.assertIn("error_type=TypeError", "\n".join(logs.output))
+        self.assertEqual(evidence[0]["policyDecision"], "unavailable")
+
+    def test_decision_helpers_reject_untyped_results(self) -> None:
+        for untyped in ({"action": "block"}, {"prediction": "MALICIOUS"}, object()):
+            with self.subTest(untyped=untyped):
+                with self.assertRaises(AttributeError):
+                    firewall._local_evidence_decision(untyped, block_action="block_returned")
+                with self.assertRaises(AttributeError):
+                    firewall._risk_label(untyped)
 
     def test_request_identity_is_retry_stable_and_content_sensitive(self) -> None:
         metadata = {"conversationId": "session-1", "toolCallId": "tool-1"}
@@ -1996,22 +2014,20 @@ class HermesFirewallTests(unittest.TestCase):
                         firewall.DEFAULT_MAX_PAYLOAD_CHARS,
                     )
 
-    def test_exact_malicious_prediction_overrides_diagnostic_outcome(self) -> None:
+    def test_block_action_overrides_diagnostic_outcome(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.99,
-            threshold=0.5,
-            primary_outcome="benign",
-        )
+        FakeFirewall.next_result = replace(MODEL_BLOCK, outcome="benign")
 
         replaced = firewall.transform_tool_result(tool_name="terminal", result="risky output")
         self.assertNotIn("risky output", replaced)
-        self.assertIn("Silmaril Firewall blocked this tool result", replaced)
+        self.assertIn(
+            "Silmaril Firewall blocked this tool result: Unexpected classification conflict.",
+            replaced,
+        )
 
     def test_failed_tool_result_observation_is_not_cached(self) -> None:
         reset_state(
@@ -2032,12 +2048,7 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertEqual(len(FakeFirewall.calls), 1)
 
         FakeFirewall.error = None
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.01,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = MODEL_BLOCK
         replaced = firewall.transform_tool_result(
             tool_name="terminal",
             result="risky output",
@@ -2051,29 +2062,35 @@ class HermesFirewallTests(unittest.TestCase):
 
     def test_unknown_risk_label_stays_generic_and_logs_debug(self) -> None:
         with self.assertLogs("hermes.plugins.firewall", level="DEBUG") as captured:
-            label = firewall._risk_label({"primary_outcome": "new_detector_family"})
+            label = firewall._risk_label(replace(MODEL_BLOCK, outcome="new_detector_family"))
 
         self.assertEqual(label, "Unsafe content")
         rendered = "\n".join(captured.output)
-        self.assertIn("unknown primary_outcome", rendered)
+        self.assertIn("unknown outcome", rendered)
         self.assertIn("new_detector_family", rendered)
 
-    def test_benign_risk_label_is_not_treated_as_unknown(self) -> None:
-        self.assertEqual(firewall._risk_label({"primary_outcome": "benign"}), "No flagged risk")
-        self.assertEqual(firewall._risk_label({"primary_outcome": None}), "No flagged risk")
+    def test_risk_label_follows_action_then_source_then_outcome(self) -> None:
+        for result, label in (
+            (ALLOW, "No flagged risk"),
+            (GOVERNANCE_ALLOW, "No flagged risk"),
+            (replace(MODEL_BLOCK, action="allow"), "No flagged risk"),
+            (GOVERNANCE_BLOCK, "Governance policy denied this action"),
+            (MODEL_BLOCK, "Unsafe agent control attempt"),
+            (replace(MODEL_BLOCK, outcome="secret_exposure"), "Sensitive information exposure"),
+            (replace(MODEL_BLOCK, outcome=None), "Unsafe content"),
+            (replace(MODEL_BLOCK, outcome={"unexpected": "shape"}), "Unsafe content"),
+            (BlockResult(action="block"), "Unsafe content"),
+        ):
+            with self.subTest(result=result):
+                self.assertEqual(firewall._risk_label(result), label)
 
-    def test_malicious_low_score_is_replaced_at_transform_boundary(self) -> None:
+    def test_block_without_assessment_is_replaced_at_transform_boundary(self) -> None:
         reset_state(
             SILMARIL_API_KEY="test-key",
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        FakeFirewall.next_result = FakeResult(
-            prediction="MALICIOUS",
-            score=0.49,
-            threshold=0.5,
-            primary_outcome="control_abuse",
-        )
+        FakeFirewall.next_result = BlockResult(action="block", mode="shadow")
 
         result = firewall.transform_llm_output(response_text="low-score output")
         self.assertNotIn("low-score output", result)
@@ -2103,14 +2120,12 @@ class HermesFirewallTests(unittest.TestCase):
             SILMARIL_API_URL="https://tenant.example/classify",
             HERMES_FIREWALL_BLOCK_MALICIOUS="true",
         )
-        original = firewall._sdk_symbols
-        firewall._sdk_symbols = lambda: (_ for _ in ()).throw(RuntimeError("missing sdk"))
-        try:
-            with self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs:
-                self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "id"}))
-            self.assertIn("error_type=RuntimeError", "\n".join(logs.output))
-        finally:
-            firewall._sdk_symbols = original
+        with (
+            mock.patch.dict(sys.modules, {"silmaril_security.sdk": None}),
+            self.assertLogs("hermes.plugins.firewall", level="WARNING") as logs,
+        ):
+            self.assertIsNone(firewall.pre_tool_call(tool_name="terminal", args={"command": "id"}))
+        self.assertIn("error_type=RuntimeError", "\n".join(logs.output))
 
     def test_logs_omit_raw_payload(self) -> None:
         reset_state(
@@ -2132,9 +2147,9 @@ class HermesFirewallTests(unittest.TestCase):
         self.assertNotIn("ignore previous instructions", rendered)
         self.assertNotIn("leak secrets", rendered)
 
-    def test_requirements_pin_sdk_082(self) -> None:
+    def test_requirements_pin_sdk_100(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("silmaril-security-sdk==0.8.2", requirements)
+        self.assertIn("silmaril-security-sdk==1.0.0", requirements)
 
     def test_reproducible_native_qa_dependencies_and_ci_are_pinned(self) -> None:
         development = Path("requirements-dev.txt").read_text(encoding="utf-8")

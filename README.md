@@ -3,8 +3,9 @@
 A fail-open Hermes directory plugin that classifies firewall lifecycle events
 with the Silmaril Security SDK. Shadow is silent. Warn adds one bounded warning
 on supported same-turn surfaces. On Hermes 0.23+, Block vetoes `pre_llm_call`
-before inference and `pre_tool_call` before execution when the model predicts
-`MALICIOUS` or governance returns `action=block`.
+before inference and `pre_tool_call` before execution when the Firewall
+decision is `action=block`, whether its source is the model or a governance
+policy.
 `post_tool_call` is observe-only. `transform_tool_result` and
 `transform_llm_output` replace Block candidates with fixed, content-free text.
 Final assistant output is held until `transform_llm_output` completes, so a
@@ -12,24 +13,24 @@ replacement is applied before any assistant text is delivered.
 
 ## Install
 
-Version `0.6.7` is the prepared source candidate. It is not asserted as
+Version `0.7.0` is the prepared source candidate. It is not asserted as
 published. For a reproducible installation after publication, check out that
 exact release and use Hermes's existing local `file://` installer:
 
 ```bash
-git clone --branch v0.6.7 --depth 1 https://github.com/Silmaril-Security/HermesFirewallPlugin.git
+git clone --branch v0.7.0 --depth 1 https://github.com/Silmaril-Security/HermesFirewallPlugin.git
 cd HermesFirewallPlugin
 hermes plugins install "file://$(pwd)" --force --enable
 hermes gateway restart
 ```
 
-Plugin version 0.6.7 requires Hermes 0.23.1 or newer with the capable
-`hold_stream` output-transform path described below, and the published Silmaril
-Security SDK 0.8.2, the version pinned in `requirements.txt`, in the same Python
-environment that runs Hermes:
+Plugin version 0.7.0 requires Hermes 0.23.1 or newer with the capable
+`hold_stream` output-transform path described below, and Silmaril Security SDK
+1.0.0, the version pinned in `requirements.txt`, in the same Python environment
+that runs Hermes:
 
 ```bash
-pip install silmaril-security-sdk==0.8.2
+pip install silmaril-security-sdk==1.0.0
 ```
 
 Copy `.env.example` into your Hermes environment manager or shell profile and
@@ -42,7 +43,7 @@ hermes plugins install Silmaril-Security/HermesFirewallPlugin --enable
 hermes gateway restart
 ```
 
-Reproducible local install from an existing v0.6.7 checkout on PowerShell:
+Reproducible local install from an existing v0.7.0 checkout on PowerShell:
 
 ```powershell
 $uri = (Get-Item .).FullName.Replace('\', '/')
@@ -81,16 +82,18 @@ stays authoritative, and a mode-less result stays Shadow.
 
 SDK import failure, missing `SILMARIL_API_KEY` or `SILMARIL_API_URL`, network
 and API errors, empty payloads, and other classification errors are logged
-with the error type and fail open. If the SDK raises `FirewallBlockedException`
-and the exception carries a classification result, the plugin uses that result.
-The hook still applies effective mode and the shared block-candidate predicate.
-An exception without a result fails open.
+with the error type and fail open. If the SDK raises `FirewallBlockedException`,
+the plugin uses the typed result the exception carries. The hook still applies
+effective mode and the shared block-candidate predicate. A result that is not
+the SDK's typed `BlockResult` raises inside the same fail-open path: it is
+logged, recorded as `unavailable`, and never read as an allow.
 
-The shared block-candidate predicate is an exact `MALICIOUS` prediction or a
-typed SDK `GovernanceDecision` with `action=block`. Governance `action=allow`,
-absent governance, scores, thresholds, outcomes, missing predictions, and
-unknown predictions do not create a candidate. A governance-only denial keeps
-the model prediction `BENIGN`; it is not relabeled as malicious. A successful
+The shared block-candidate predicate is the typed SDK result's `blocked`
+property: an `action` other than `allow`. `source`, `confidence`, `severity`,
+`outcome`, and an attached `GovernanceDecision` neither create nor cancel a
+candidate. A block whose `source` is `governance` uses policy-denial copy and
+is recorded with a benign model prediction; it is not relabeled as malicious. A
+successful
 `post_tool_call` classification is reused by the matching
 `transform_tool_result` when the session, task, tool call id, tool name, and
 content match, so that pair makes one SDK request. A failed observation is not
@@ -125,19 +128,25 @@ native action `unavailable` and `blockUnavailable=true`; this does not assert
 that Hermes prevented the auxiliary call.
 
 Each successful SDK call logs an `sdk_result` line containing event type, hook
-label, tool name, tool call id when present, prediction, readable risk category,
-and whether the result is a block candidate. Raw governance objects, prompts, tool
-arguments, tool outputs, assistant text, classifier scores, thresholds, detector
-maps, and raw decision JSON are not emitted in structured logs or model-visible
-context.
+label, tool name, tool call id when present, action, source, readable risk
+category, and whether the result is a block candidate. Raw governance objects,
+prompts, tool arguments, tool outputs, assistant text, and raw decision JSON are
+not emitted in structured logs or model-visible context.
 
 Every hook invocation also attempts to write one bounded `LocalProtectionEventV1` JSON
 record to the private local evidence spool, including fail-open results. The
 record contains redacted metadata, opaque request/session fingerprints,
-decision facts, native action, and plugin provenance. Unit-interval scores and
-thresholds may be stored as `modelScore` and `modelThreshold`. It never
-contains raw prompts, arguments, results, assistant output, credentials,
-detector maps, or error bodies. Events always report `outcome=not_observed`.
+decision facts, native action, and plugin provenance. The decision's
+`confidence` (`very_low`, `low`, `medium`, `high`, `very_high`) and `severity`
+(`minimal`, `low`, `moderate`, `high`, `critical`) are stored when the Firewall
+reports one of those values; `modelScore` and `modelThreshold` are not written.
+`provenance.modelVersion` records the decision's model identifier when the
+Firewall reports one, and `provenance.policyVersion` records the governance
+decision's policy version when the decision carries governance; neither is
+written otherwise. Both are stripped of control and format characters and cut
+to 128 UTF-8 bytes.
+It never contains raw prompts, arguments, results, assistant output,
+credentials, or error bodies. Events always report `outcome=not_observed`.
 A returned Hermes native veto (`nativeAction=block_returned`) reports
 `evidenceTruth=native_response_returned`. Every other native action, including
 Warn and transform replacement (`nativeAction=content_replaced`), reports
@@ -159,6 +168,8 @@ Required environment variables:
 
 - `SILMARIL_API_KEY`: API key for the Silmaril Firewall classify API.
 - `SILMARIL_API_URL`: tenant `/classify` endpoint for the Silmaril Firewall API.
+  The SDK calls `/v2/classify` on the same base and falls back to `/classify`
+  on deployments that do not serve it, so the value does not change.
 
 Optional environment variables:
 
@@ -176,14 +187,14 @@ file parser, credential service, or fallback that writes secrets into plugin
 state.
 
 Every classifier request carries plugin-owned `metadata.silmaril` with
-`integration` `hermes-firewall`, `version` `0.6.7`, and `provenance`.
+`integration` `hermes-firewall`, `version` `0.7.0`, and `provenance`.
 Provenance always includes `schema_version` 1 and `harness` `hermes`. A valid
 UUID v4 `SILMARIL_ENDPOINT_ID` adds `endpoint_id`; an invalid value is omitted
 with a warning. On macOS, a successful ComputerName lookup can add
 `device_name`. Classification continues when either value is absent.
 `device_name` is not written into local evidence.
 
-Requests also use the SDK 0.8.2 typed governance fields. Every request sets the
+Requests also use the SDK typed governance fields. Every request sets the
 canonical agent to `hermes`. Model/user boundaries use an `agent` resource with
 id `hermes`; tool-call and tool-response boundaries use a `tool` resource whose
 id is the trusted native `tool_name`. Hermes 0.23 does not provide a trusted MCP
@@ -276,7 +287,7 @@ Silmaril Firewall blocked this assistant output: Unsafe agent control attempt. C
 ```
 
 The warning string is fixed. It does not include raw prompts, arguments,
-secrets, scores, thresholds, detector maps, or hidden policy.
+secrets, confidence, severity, or hidden policy.
 
 ## Public Demo
 

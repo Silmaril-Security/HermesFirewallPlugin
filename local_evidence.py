@@ -10,20 +10,24 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
-import math
 import os
 import re
 import stat
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from silmaril_security.sdk import BlockResult
 
 
 LOCAL_PROTECTION_EVENT_SCHEMA_VERSION = 1
 PROVENANCE_SCHEMA_VERSION = 1
 MAX_LOCAL_PROTECTION_EVENT_BYTES = 16 * 1024
 MAX_SUMMARY_LENGTH = 280
+MAX_PROVENANCE_BYTES = 128
 DEFAULT_EVENT_DIRECTORY_COMPONENTS = (
     "Library",
     "Application Support",
@@ -31,6 +35,9 @@ DEFAULT_EVENT_DIRECTORY_COMPONENTS = (
     "Evidence",
     "incoming",
 )
+_CONFIDENCE_LEVELS = frozenset({"very_low", "low", "medium", "high", "very_high"})
+_SEVERITY_LEVELS = frozenset({"minimal", "low", "moderate", "high", "critical"})
+_UNSAFE_PROVENANCE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 _SAFE_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._:/-]{0,63}$")
 _RUNTIME_CHECK_MARKER = re.compile(
@@ -66,7 +73,7 @@ def build_local_protection_event(
     mode: str,
     raw_text: str,
     fields: Mapping[str, Any],
-    classification: Mapping[str, Any] | None,
+    classification: BlockResult | None,
     policy_decision: str,
     native_action: str,
     plugin_name: str,
@@ -78,9 +85,8 @@ def build_local_protection_event(
     """Build the frozen LocalProtectionEventV1 JSON shape."""
 
     observed_at = _iso8601_utc(occurred_at or datetime.now(timezone.utc))
-    result = classification or {}
-    prediction = _normalize_prediction(result.get("prediction"))
-    consequence = _attempted_consequence(result, prediction)
+    prediction = _prediction(classification)
+    consequence = _attempted_consequence(classification, prediction)
     request_identity = _request_identity(event, fields)
     session_identity = _session_identity(fields)
     request_fingerprint = _request_fingerprint(
@@ -132,22 +138,33 @@ def build_local_protection_event(
         },
     }
 
-    optional_fields = {
-        "requestFingerprint": request_fingerprint,
-        "sessionFingerprint": session_fingerprint,
-        "toolDisplayName": tool_display_name,
-        "riskClass": consequence["category"],
-        "modelScore": _unit_interval(result.get("score")),
-        "modelThreshold": _unit_interval(result.get("threshold")),
-        "warnDelivery": warn_delivery,
-        "blockUnavailable": True if block_unavailable else None,
-    }
-    local_event.update(
-        {
-            key: value
-            for key, value in optional_fields.items()
-            if value is not None
+    decision_evidence: dict[str, Any] = {}
+    provenance_versions: dict[str, Any] = {}
+    if classification is not None:
+        governance = classification.governance
+        decision_evidence = {
+            "confidence": _known_level(classification.confidence, _CONFIDENCE_LEVELS),
+            "severity": _known_level(classification.severity, _SEVERITY_LEVELS),
         }
+        provenance_versions = {
+            "policyVersion": _bounded_provenance(
+                None if governance is None else governance.policy_version
+            ),
+            "modelVersion": _bounded_provenance(classification.model_id),
+        }
+    local_event["provenance"].update(_present(provenance_versions))
+    local_event.update(
+        _present(
+            {
+                "requestFingerprint": request_fingerprint,
+                "sessionFingerprint": session_fingerprint,
+                "toolDisplayName": tool_display_name,
+                "riskClass": consequence["category"],
+                **decision_evidence,
+                "warnDelivery": warn_delivery,
+                "blockUnavailable": True if block_unavailable else None,
+            }
+        )
     )
     return local_event
 
@@ -258,21 +275,41 @@ def _iso8601_utc(value: datetime) -> str:
     )
 
 
-def _normalize_prediction(value: Any) -> str:
-    if value == "MALICIOUS":
-        return "malicious"
-    if value == "BENIGN":
-        return "benign"
-    if value is None:
+def _prediction(result: BlockResult | None) -> str:
+    if result is None:
         return "unavailable"
-    return "unknown"
+    if result.blocked and result.source != "governance":
+        return "malicious"
+    return "benign"
+
+
+def _known_level(value: Any, levels: frozenset[str]) -> str | None:
+    return value if isinstance(value, str) and value in levels else None
+
+
+def _present(fields: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def _bounded_provenance(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(
+        character
+        for character in value
+        if unicodedata.category(character) not in _UNSAFE_PROVENANCE_CATEGORIES
+    ).strip()
+    return (
+        cleaned.encode("utf-8")[:MAX_PROVENANCE_BYTES].decode("utf-8", errors="ignore")
+        or None
+    )
 
 
 def _attempted_consequence(
-    result: Mapping[str, Any],
+    result: BlockResult | None,
     prediction: str,
 ) -> dict[str, str]:
-    raw_outcome = result.get("primary_outcome")
+    raw_outcome = None if result is None else result.outcome
     normalized = (
         raw_outcome.strip().lower().replace("-", "_").replace(" ", "_")
         if isinstance(raw_outcome, str)
@@ -363,14 +400,6 @@ def _frame(components: tuple[str, ...]) -> bytes:
         f"{len(component.encode('utf-8'))}:{component}"
         for component in components
     ).encode("utf-8")
-
-
-def _unit_interval(value: Any) -> float | int | None:
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        return None
-    if not math.isfinite(value) or not 0 <= value <= 1:
-        return None
-    return value
 
 
 def _safe_tool_display_name(value: Any) -> str | None:
